@@ -13,6 +13,10 @@ const INDEX_MAGIC: &[u8; 4] = b"HLSS";
 const INDEX_FORMAT: u32 = 1;
 const INDEX_HEADER: usize = 4 + 4 + 8;
 const RECORD_HEADER: usize = 4 + 4 + 8 + 2;
+/// Columns one `drain_details` call hands the far terrain worker. The worker
+/// tests for a `Lod` being dropped between batches, so the game thread's
+/// `Lod::drop` waits for one batch, not for every column the store holds.
+const DETAIL_BATCH: usize = 16;
 
 pub struct Store {
     cache: DiskCache,
@@ -146,8 +150,12 @@ impl LodSampler for StoreSampler {
         }))
     }
 
-    fn request_detail(&mut self, _chunks: &[(i32, i32)], _center: [i32; 2]) {
-        for (pos, _) in self.store.stamps() {
+    fn request_detail(&mut self, chunks: &[(i32, i32)], _center: [i32; 2]) {
+        // Only the columns the far terrain asked for. The store holds every
+        // column it ever received, and reading them all back is seconds of
+        // work on this thread -- which `Lod::drop` joins when the player
+        // leaves the server.
+        for &pos in chunks {
             if !self.details.contains(&pos) {
                 self.details.push(pos);
             }
@@ -155,7 +163,13 @@ impl LodSampler for StoreSampler {
     }
 
     fn drain_details(&mut self) -> Vec<LodDetail> {
-        std::mem::take(&mut self.details)
+        // A bounded batch: the far terrain worker checks for a `Lod` being
+        // dropped between batches, and `Lod::drop` joins that worker. Reading
+        // every column of a large store in one call is seconds the game thread
+        // would wait there.
+        let take = self.details.len().min(DETAIL_BATCH);
+        let rest = self.details.split_off(take);
+        std::mem::replace(&mut self.details, rest)
             .into_iter()
             .filter_map(|pos| self.store.columns(pos).map(|columns| (pos, columns)))
             .collect()
@@ -458,6 +472,67 @@ mod tests {
         let store = Arc::new(Store::open(dir.clone(), 7).unwrap());
         let mut sampler = store.sampler();
         assert_eq!(sampler.reduced_column(0, 0, 1), Column::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The far terrain asks for the columns it needs detail for; the store
+    /// answers with those, not with every column it holds. Reading the whole
+    /// store back is seconds of work on the sampling thread, which `Lod::drop`
+    /// joins when the player leaves the server.
+    #[test]
+    fn detail_requests_are_the_chunks_asked_for() {
+        let dir = temp_dir("detail");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::open(dir.clone(), 8).unwrap());
+        let cols = chunk_columns(0);
+        for i in 0..8 {
+            store.put((i, 0), 1, &cols, coarse_for(&cols));
+        }
+        let mut sampler = store.sampler();
+        sampler.request_detail(&[(2, 0), (5, 0)], [0, 0]);
+        let mut asked: Vec<(i32, i32)> = sampler
+            .drain_details()
+            .into_iter()
+            .map(|(pos, _)| pos)
+            .collect();
+        asked.sort_unstable();
+        assert_eq!(asked, vec![(2, 0), (5, 0)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `drain_details` hands back a bounded batch, and the rest wait for the
+    /// next call. The far terrain worker tests for a `Lod` being dropped
+    /// between batches, so an unbounded read there is a wait the game thread
+    /// pays in `Lod::drop` when the player leaves.
+    #[test]
+    fn detail_batches_are_bounded_and_the_rest_wait() {
+        let dir = temp_dir("batch");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::open(dir.clone(), 9).unwrap());
+        let cols = chunk_columns(0);
+        let asked: Vec<(i32, i32)> = (0..40).map(|i| (i, 0)).collect();
+        for &pos in &asked {
+            store.put(pos, 1, &cols, coarse_for(&cols));
+        }
+        let mut sampler = store.sampler();
+        sampler.request_detail(&asked, [0, 0]);
+        let first = sampler.drain_details();
+        assert_eq!(
+            first.len(),
+            DETAIL_BATCH,
+            "one call must not read the whole store back"
+        );
+        let mut seen: Vec<(i32, i32)> = first.into_iter().map(|(pos, _)| pos).collect();
+        // Every column arrives exactly once, over the calls that follow.
+        loop {
+            let batch = sampler.drain_details();
+            if batch.is_empty() {
+                break;
+            }
+            seen.extend(batch.into_iter().map(|(pos, _)| pos));
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, asked);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

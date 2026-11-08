@@ -1554,7 +1554,16 @@ impl Lod {
                         }
                         let mut asked = 0;
                         'work: loop {
+                            // A `Lod` being dropped stops here, before the
+                            // batch is read back and warmed: that is the work
+                            // the game thread waits for in `drop`.
+                            if worker.stop.load(Ordering::Relaxed) {
+                                break 'work;
+                            }
                             for (key, columns) in sampler.drain_details() {
+                                if worker.stop.load(Ordering::Relaxed) {
+                                    break 'work;
+                                }
                                 if tx
                                     .send(Done::Detail(
                                         key,
