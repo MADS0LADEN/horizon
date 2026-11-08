@@ -338,7 +338,7 @@ mod tests {
                     water: None,
                     biome: 0,
                 }),
-                spans: vec![span(0, 10, i)],
+                spans: vec![span(0, 10, i)].into(),
             }
         })
     }

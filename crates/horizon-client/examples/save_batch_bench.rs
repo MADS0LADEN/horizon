@@ -2,6 +2,7 @@
 //! full chunk NBT encoder. Run with `cargo run --profile fast -p horizon-client
 //! --example save_batch_bench`. Add `-- --nbt` to also time serialization.
 //! Exact NBT equality is always validated. No GPU, compression or disk I/O timed.
+extern crate horizon_client_lib as horizon_client;
 use horizon_client::{
     biome::Biomes,
     chunk::{Chunk, block_strategy},
@@ -18,7 +19,7 @@ use horizon_world::{
 use std::{collections::HashMap, hint::black_box, sync::Arc, time::Instant};
 
 type Entities = HashMap<(i32, i32, i32), BlockEntity>;
-type Names = HashMap<(i32, i32, i32), String>;
+type Names = HashMap<(i32, i32, i32), Tag>;
 const BLOCKS: [&str; 5] = [
     "minecraft:air",
     "minecraft:stone",
@@ -95,7 +96,10 @@ fn fixture(per_chunk: usize) -> (Vec<Arc<Chunk>>, Entities, Names) {
             }
             c.set(p.0 & 15, p.1, p.2 & 15, block);
             if j % 4 == 2 {
-                names.insert(p, format!("Storage {x},{z}/{j}"));
+                names.insert(
+                    p,
+                    Tag::String(format!("Storage {x},{z}/{j}").as_str().into()),
+                );
             }
             // Exercise the existing NBT overlay and saved list order as well.
             if j % 8 == 2 {

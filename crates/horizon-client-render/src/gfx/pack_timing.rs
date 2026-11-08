@@ -1,14 +1,17 @@
-//! GPU time of each pass of a shader pack, of either kind: shown in the F3 overlay while it is
-//! open, and logged every `REPORT` timed frames with `HORIZON_SHADER_PACK_TIMING=1`. One frame
+//! GPU time of each pass of a shader pack, of either kind, and of Horizon's own passes: shown in
+//! the F3 overlay while it is open, and logged every `REPORT` timed frames with
+//! `HORIZON_SHADER_PACK_TIMING=1`. One frame
 //! at a time is timed, and the CPU never waits for it: its timestamps are resolved in a later
 //! frame, once the GPU has finished it (Metal resolves them without waiting for the passes that
-//! write them), then read back when mapped. The next frame after that is timed again.
+//! write them), then read back when mapped. The next frame after that is timed again, once `gap`
+//! has passed since the last.
 
 use std::collections::VecDeque;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::{Duration, Instant};
 
 const REPORT: usize = 30;
 /// Passes timed per frame at most (two timestamps each).
@@ -42,6 +45,10 @@ pub struct PassTiming {
     /// `mark`'s pipeline, for the target format it was made for.
     marker: Option<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
     reports: usize,
+    /// Least time between timed frames.
+    pub gap: Duration,
+    /// When the last timed frame began.
+    timed_at: Option<Instant>,
 }
 
 impl PassTiming {
@@ -80,6 +87,8 @@ impl PassTiming {
             log: Self::logging(),
             marker: None,
             reports: 0,
+            gap: Duration::ZERO,
+            timed_at: None,
         })
     }
 
@@ -122,9 +131,12 @@ impl PassTiming {
             }
             _ => {}
         }
-        if matches!(self.stage, Stage::Idle) {
+        if matches!(self.stage, Stage::Idle)
+            && self.timed_at.is_none_or(|at| at.elapsed() >= self.gap)
+        {
             self.names.clear();
             self.stage = Stage::Recording;
+            self.timed_at = Some(Instant::now());
         }
     }
 
@@ -137,6 +149,12 @@ impl PassTiming {
     pub fn writes(&mut self, name: &str) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
         let i = self.push(name)?;
         Some(stamps(&self.queries, i))
+    }
+
+    /// Timestamp writes for the compute pass `name`, in a timed frame.
+    pub fn compute_writes(&mut self, name: &str) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+        let i = self.push(name)?;
+        Some(compute_stamps(&self.queries, i))
     }
 
     /// The index of the timed frame's next pass, `name`.
@@ -268,6 +286,15 @@ impl PassTiming {
 /// Pass `i`'s beginning and end timestamps.
 fn stamps(queries: &wgpu::QuerySet, i: u32) -> wgpu::RenderPassTimestampWrites<'_> {
     wgpu::RenderPassTimestampWrites {
+        query_set: queries,
+        beginning_of_pass_write_index: Some(2 * i),
+        end_of_pass_write_index: Some(2 * i + 1),
+    }
+}
+
+/// The compute pass's twin of `stamps`.
+fn compute_stamps(queries: &wgpu::QuerySet, i: u32) -> wgpu::ComputePassTimestampWrites<'_> {
+    wgpu::ComputePassTimestampWrites {
         query_set: queries,
         beginning_of_pass_write_index: Some(2 * i),
         end_of_pass_write_index: Some(2 * i + 1),

@@ -53,17 +53,26 @@ impl Game<'_> {
     }
 
     pub(super) fn lss_payload(&mut self, channel: &str, data: &[u8]) {
-        let Some(client) = self.remote.as_mut().and_then(|r| r.lss.as_mut()) else {
-            return;
+        let (changed, active, distance) = {
+            let Some(client) = self.remote.as_mut().and_then(|r| r.lss.as_mut()) else {
+                return;
+            };
+            let was_active = client.active();
+            client.on_payload(channel, data);
+            (
+                client.active() != was_active,
+                client.active(),
+                client.server_distance(),
+            )
         };
-        let was_active = client.active();
-        client.on_payload(channel, data);
-        if client.active() != was_active {
+        if changed {
             log::info!(
-                "LSS: far terrain from the server {}, {} chunks",
-                if client.active() { "on" } else { "off" },
-                client.server_distance()
+                "LSS: far terrain from the server {}, {distance} chunks",
+                if active { "on" } else { "off" }
             );
+            // The source changes: far terrain is built again from the new one
+            // (`prepare_lod`), rather than keeping the one it had.
+            self.clear_lod();
         }
     }
 

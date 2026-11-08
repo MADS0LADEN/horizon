@@ -13,7 +13,8 @@ use std::collections::HashMap;
 
 /// Lights the shaders read: `Globals.dynamic_lights` in gfx.rs, terrain.wgsl and entity.wgsl.
 pub const MAX: usize = 16;
-/// Camera-relative position and radius; RGB intensity in a second vec4.
+/// Camera-relative position and radius; RGB intensity in a second vec4. The shaders read it as a flat
+/// `array<vec4<f32>, 32>` (nested arrays need ARB_arrays_of_arrays, absent from GL below 4.3).
 pub type Colored = [[f32; 4]; 2];
 
 /// Nearest validated native visual lights; never enters gameplay lighting.
@@ -75,6 +76,12 @@ impl Luminance {
         self.0.get(item).copied().unwrap_or(0)
     }
 
+    /// The HDR tier of an item that glows, as its block's (`mesher::hdr_tier`), 0 for the rest.
+    pub fn hdr_tier(&self, item: &str) -> u8 {
+        let name = item.strip_prefix("minecraft:").unwrap_or(item);
+        crate::mesher::hdr_tier(name, self.of(item)) & !crate::mesher::WHOLE
+    }
+
     #[cfg(test)]
     fn from_pairs(pairs: &[(&str, u8)]) -> Self {
         Self(pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect())
@@ -91,14 +98,42 @@ pub struct Source {
 /// The [`MAX`] sources nearest `camera` within reach, as the shaders read them: camera-relative
 /// position and level. Overwrites `out`.
 pub fn select(sources: &[Source], camera: DVec3, out: &mut Vec<[f32; 4]>) {
+    select_iter(sources.iter().copied(), camera, out);
+}
+
+/// Streaming selection with the same stable distance order as [`select`]. Only the best
+/// [`MAX`] sources are kept, and each source's distance is evaluated once.
+pub fn select_iter(
+    sources: impl IntoIterator<Item = Source>,
+    camera: DVec3,
+    out: &mut Vec<[f32; 4]>,
+) {
     out.clear();
-    let key = |s: &Source| s.at.distance_squared(camera);
-    let mut near: Vec<&Source> = sources
-        .iter()
-        .filter(|s| s.level > 0 && key(s) <= REACH * REACH)
-        .collect();
-    near.sort_by(|a, b| key(a).total_cmp(&key(b)));
-    out.extend(near.into_iter().take(MAX).map(|s| {
+    let mut near = [(
+        0.0_f64,
+        Source {
+            at: DVec3::ZERO,
+            level: 0,
+        },
+    ); MAX];
+    let mut len = 0;
+    for source in sources {
+        let distance = source.at.distance_squared(camera);
+        // The original <= test also rejects NaN and infinite distances.
+        if source.level == 0 || !(0.0..=REACH * REACH).contains(&distance) {
+            continue;
+        }
+        let at = near[..len].partition_point(|(d, _)| d.total_cmp(&distance).is_le());
+        if at == MAX {
+            continue;
+        }
+        // Insert after equal distances: the first MAX sources in input order win ties.
+        let end = len.min(MAX - 1);
+        near.copy_within(at..end, at + 1);
+        near[at] = (distance, source);
+        len = (len + 1).min(MAX);
+    }
+    out.extend(near[..len].iter().map(|(_, s)| {
         let p = (s.at - camera).as_vec3();
         [p.x, p.y, p.z, f32::from(s.level.min(15))]
     }));
@@ -117,6 +152,23 @@ pub fn level_at(pos: [f32; 3], lights: &[[f32; 4]]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn items_shine_as_their_blocks() {
+        use crate::mesher::{BRIGHT, INCANDESCENT};
+        let lum = Luminance::from_pairs(&[
+            ("minecraft:torch", 14),
+            ("minecraft:glowstone", 15),
+            ("minecraft:lava_bucket", 15),
+            ("minecraft:campfire", 15),
+        ]);
+        assert_eq!(lum.hdr_tier("minecraft:torch"), INCANDESCENT);
+        assert_eq!(lum.hdr_tier("minecraft:glowstone"), BRIGHT);
+        assert_eq!(lum.hdr_tier("minecraft:lava_bucket"), INCANDESCENT);
+        // Items carry no sprite thresholds: only the tier, not "all over".
+        assert_eq!(lum.hdr_tier("minecraft:campfire"), BRIGHT);
+        assert_eq!(lum.hdr_tier("minecraft:apple"), 0);
+    }
 
     #[test]
     fn colored_sources_are_camera_relative_and_bounded() {
@@ -153,6 +205,104 @@ mod tests {
         assert_eq!(out[MAX - 1][0], (MAX - 1) as f32);
         select(&[], camera, &mut out);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn streaming_selection_matches_stable_full_sort() {
+        let camera = DVec3::new(30_000_000.0, -64.0, -30_000_000.0);
+        let mut seed = 0x8469_d28b_314a_723fu64;
+        let mut sources = Vec::new();
+        for i in 0..2048 {
+            let offset = std::array::from_fn::<_, 3, _>(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed % 241) as f64 - 120.0
+            });
+            sources.push(Source {
+                at: camera + DVec3::from(offset),
+                level: (i % 22) as u8,
+            });
+        }
+        sources.extend([
+            Source {
+                at: camera + DVec3::X * 96.0,
+                level: 14,
+            },
+            Source {
+                at: camera - DVec3::X * 96.0,
+                level: 15,
+            },
+            Source {
+                at: camera + DVec3::X * 96.0001,
+                level: 15,
+            },
+            Source {
+                at: DVec3::splat(f64::NAN),
+                level: 15,
+            },
+            Source {
+                at: DVec3::splat(f64::INFINITY),
+                level: 15,
+            },
+        ]);
+        let reference = |input: &[Source], camera: DVec3| {
+            let mut selected: Vec<_> = input
+                .iter()
+                .filter(|s| s.level > 0 && s.at.distance_squared(camera) <= 96.0 * 96.0)
+                .collect();
+            selected.sort_by(|a, b| {
+                a.at.distance_squared(camera)
+                    .total_cmp(&b.at.distance_squared(camera))
+            });
+            selected
+                .into_iter()
+                .take(16)
+                .map(|s| {
+                    let p = (s.at - camera).as_vec3();
+                    [p.x, p.y, p.z, f32::from(s.level.min(15))]
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut out = vec![[999.0; 4]; 20];
+        for input in [sources.clone(), sources.into_iter().rev().collect()] {
+            for n in [0, 1, 15, 16, 17, 40, input.len()] {
+                select_iter(input[..n].iter().copied(), camera, &mut out);
+                assert_eq!(out, reference(&input[..n], camera));
+            }
+            select_iter(input.iter().copied(), DVec3::splat(f64::NAN), &mut out);
+            assert!(out.is_empty());
+        }
+    }
+
+    #[test]
+    fn equal_distances_keep_first_sources_and_reach_is_inclusive() {
+        // Every source ties: neither a different position nor a different light level
+        // may win the sixteenth slot just because it was inserted later.
+        let sources: Vec<_> = (0..40)
+            .map(|i| Source {
+                at: if i % 2 == 0 {
+                    DVec3::X * 96.0
+                } else {
+                    -DVec3::X * 96.0
+                },
+                level: (i % 15 + 1) as u8,
+            })
+            .collect();
+        let mut out = Vec::new();
+        select_iter(sources, DVec3::ZERO, &mut out);
+        assert_eq!(out.len(), 16);
+        for (i, light) in out.iter().enumerate() {
+            assert_eq!(
+                *light,
+                [
+                    if i % 2 == 0 { 96.0 } else { -96.0 },
+                    0.0,
+                    0.0,
+                    (i % 15 + 1) as f32
+                ]
+            );
+        }
     }
 
     #[test]

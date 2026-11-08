@@ -14,10 +14,7 @@ use horizon_client::{
     mobs::{
         Mob, Species,
         equip::{self, Facts, ItemTags, Slot},
-        finalize::{
-            self, set_drop_chance, set_item, set_slot_enchantments, slot_enchantments,
-            stored_drop_chance,
-        },
+        finalize::{self, set_drop_chance, set_item_stack, stored_drop_chance},
     },
 };
 use horizon_core::{geometry::Vec3, random::RandomSource};
@@ -28,17 +25,29 @@ impl Game<'_> {
         if self.dropped.is_empty() || !self.ui.rules.bool("mob_griefing") {
             return;
         }
+        let mut near = super::item_areas::ItemAreas::default();
         for i in 0..self.mobs.len() {
             let m = &self.mobs[i];
-            if !m.can_pick_up_loot() || !m.alive() || m.removed {
+            if !m.can_pick_up_loot()
+                || !m.alive()
+                || m.removed
+                || !self.creatures.ticked.contains(&m.id)
+            {
                 continue;
             }
             // `Mob.ITEM_PICKUP_REACH`.
             let reach = m.bounds().inflate(Vec3::new(1.0, 0.0, 1.0));
+            let mut scan = near.scan(&self.dropped, self.next_entity, reach);
+            if scan.is_empty() {
+                continue;
+            }
             let (species, baby, passenger) = (m.species(), m.is_baby(), m.extra.passenger);
             let mut j = 0;
-            while j < self.dropped.len() {
-                let e = &self.dropped[j];
+            loop {
+                j = scan.next_from(j, self.dropped.len());
+                let Some(e) = self.dropped.get(j) else {
+                    break;
+                };
                 if e.pickup_delay > 0 || !reach.intersects(e.bounds()) {
                     j += 1;
                     continue;
@@ -69,6 +78,7 @@ impl Game<'_> {
                 e.stack.count -= taken;
                 if e.stack.count == 0 {
                     self.remove_dropped(j);
+                    scan.removed(j);
                 } else {
                     j += 1;
                 }
@@ -92,44 +102,63 @@ impl Game<'_> {
         if !replace {
             return None;
         }
-        // shortcut: a mob's equipment is one item per slot here, so a hand
-        // takes one item of a stack where vanilla takes the whole stack;
-        // upgrade with a per-slot count in `Extra`.
-        let taken = 1;
+        // `EquipmentSlot.limit`: an armour slot takes one item, a hand the
+        // whole stack.
+        let taken = if slot.is_armor() {
+            1
+        } else {
+            stack.count.max(1)
+        };
         let m = &mut self.mobs[index];
-        let old = finalize::item(m, slot.index());
+        let old = finalize::item_stack(m, slot.index());
         let chance = stored_drop_chance(m, slot.index());
-        let old_enchantments = slot_enchantments(m, slot.index());
         // `DropChances.byEquipment` against the roll the equip makes.
         let drop_old = old.is_some() && (m.random.next_float() - 0.1).max(0.0) < chance;
-        set_item(m, slot.index(), item);
-        // The stack's enchantments come with it: a Sharpness V sword stays sharp.
-        set_slot_enchantments(m, slot.index(), stack.enchantments().to_vec());
+        // The whole stack comes with it: its enchantments (a Sharpness V sword
+        // stays sharp), damage, name and components.
+        let mut equipped = stack.clone();
+        equipped.count = taken;
+        set_item_stack(m, slot.index(), equipped);
         // `setItemSlotAndDropWhenKilled`, then `persistenceRequired`.
         set_drop_chance(m, slot.index(), 2.0);
         m.persistent = true;
         let at = [m.position.x, m.position.y, m.position.z];
+        let id = m.id;
         if drop_old && let Some(old) = old {
-            let mut dropped = ItemStack::new(&old, 1);
-            dropped.set_crafting_enchantments(old_enchantments);
-            self.spawn_item(dropped, at, super::dispenser::new_item_motion(), 10);
+            self.spawn_item_own(old, at, 10);
         }
+        self.mob_equip_event(id, at, true);
         Some(taken)
     }
 
     /// `Mob.canReplaceCurrentItem` for what `m` wears or holds in `slot`.
     fn can_replace(&self, index: usize, stack: &ItemStack, slot: Slot) -> bool {
         let m = &self.mobs[index];
-        let Some(current) = finalize::item(m, slot.index()) else {
+        let Some(worn_stack) = finalize::item_stack(m, slot.index()) else {
             return true;
         };
+        let current = worn_stack.item.clone();
         let species = m.species();
         // `Drowned.canReplaceCurrentItem` never parts with a nautilus shell.
         if species == Species::Drowned && &*current == "minecraft:nautilus_shell" {
             return false;
         }
+        let new = self.stack_facts(m, stack, slot);
+        let worn = self.stack_facts(m, &worn_stack, slot);
+        let preferred = equip::preferred_weapon_tag(species).map(|tag| {
+            (
+                self.items().item_in_tag(tag, &stack.item),
+                self.items().item_in_tag(tag, &current),
+            )
+        });
+        equip::can_replace_current_item(&new, Some(&worn), slot, preferred)
+    }
+
+    /// The numbers `Mob.compareArmor` and `compareWeapons` read off `stack`
+    /// in `slot` for the mob `m`.
+    pub(super) fn stack_facts(&self, m: &Mob, stack: &ItemStack, slot: Slot) -> Facts {
         let (armor, toughness, attack) = self.attributes(m, &stack.item, slot);
-        let new = Facts {
+        Facts {
             armor,
             armor_toughness: toughness,
             attack_damage: attack,
@@ -139,30 +168,7 @@ impl Game<'_> {
             // `EnchantmentEffectComponents.PREVENT_ARMOR_CHANGE` is the Curse of
             // Binding's, the only enchantment that carries one.
             prevents_armor_change: stack.enchantment_level("minecraft:binding_curse") > 0,
-        };
-        let worn_enchantments = slot_enchantments(m, slot.index());
-        let (armor, toughness, attack) = self.attributes(m, &current, slot);
-        // shortcut: what a mob already wears keeps no damage value or name here
-        // (`Extra` records neither), so a worn piece always compares as fresh;
-        // upgrade with a stack per equipment slot.
-        let worn = Facts {
-            armor,
-            armor_toughness: toughness,
-            attack_damage: attack,
-            enchantments: worn_enchantments.len(),
-            damage: 0,
-            custom_name: false,
-            prevents_armor_change: worn_enchantments
-                .iter()
-                .any(|(id, level)| &**id == "minecraft:binding_curse" && *level > 0),
-        };
-        let preferred = equip::preferred_weapon_tag(species).map(|tag| {
-            (
-                self.items().item_in_tag(tag, &stack.item),
-                self.items().item_in_tag(tag, &current),
-            )
-        });
-        equip::can_replace_current_item(&new, Some(&worn), slot, preferred)
+        }
     }
 
     /// `Mob.getApproximateAttributeWith` for the item `id` in `slot`: each
