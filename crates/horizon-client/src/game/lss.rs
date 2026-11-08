@@ -126,6 +126,9 @@ impl Game<'_> {
         let stats = client.stats();
         serde_json::json!({
             "active": client.active(),
+            // The level key the session streams (`hoxy:test2`), not its
+            // dimension type: two levels can share `minecraft:overworld`.
+            "level": client.level(),
             "distance": client.distance(),
             "server_distance": client.server_distance(),
             "known": stats.session.known,

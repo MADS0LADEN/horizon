@@ -8,7 +8,7 @@ use crate::chunk::ColumnLayout;
 use crate::lod::{Column, ReducedColumns};
 use crate::streaming::LodSource;
 use horizon_world::registry::BlockRegistry;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub struct Shared {
@@ -73,7 +73,7 @@ impl Client {
 
     pub fn enter_dimension(&mut self, dimension: Dimension) {
         self.level = None;
-        let dir = self.root.join(sanitize_name(&dimension.name));
+        let dir = level_dir(&self.root, &dimension.name);
         match Store::open(dir, self.storage_key) {
             Ok(store) => {
                 let store = Arc::new(store);
@@ -116,8 +116,14 @@ impl Client {
             },
             wire::BATCH_RESPONSE => match wire::batch_response(data) {
                 Ok(responses) => {
+                    // `lss:batch_response` carries no dimension: it answers the
+                    // requests this level sent, and the session drops any other
+                    // (`Session::on_response`).
+                    let Some(level) = self.level().map(str::to_owned) else {
+                        return true;
+                    };
                     for (response, pos) in responses {
-                        self.session.on_response(response, pos);
+                        self.session.on_response(&level, response, pos);
                     }
                 }
                 Err(error) => log::debug!("LSS batch_response: {error}"),
@@ -145,7 +151,15 @@ impl Client {
                 }
             }
             wire::DIRTY_COLUMNS => match wire::dirty_columns(data) {
-                Ok(positions) => self.session.on_dirty(&positions),
+                Ok(positions) => {
+                    // No dimension in the payload: `Session::on_dirty` keeps
+                    // only positions this level has (another level's notice is
+                    // not this level's terrain).
+                    let Some(level) = self.level().map(str::to_owned) else {
+                        return true;
+                    };
+                    self.session.on_dirty(&level, &positions);
+                }
                 Err(error) => log::debug!("LSS dirty_columns: {error}"),
             },
             _ => log::debug!("LSS unknown channel {channel}"),
@@ -188,6 +202,15 @@ impl Client {
         self.session.enabled() && self.level.is_some()
     }
 
+    /// The level key the session streams now (`hoxy:test2`, `minecraft:overworld`),
+    /// as the server names it — the LSS key, not the dimension type two
+    /// overworld-type levels would share.
+    pub fn level(&self) -> Option<&str> {
+        self.level
+            .as_ref()
+            .map(|level| level.dimension.name.as_str())
+    }
+
     pub fn distance(&self) -> i32 {
         self.session.distance()
     }
@@ -225,6 +248,15 @@ fn sanitize_name(name: &str) -> String {
         .collect()
 }
 
+/// A level's folder under the server's `lss/` folder. The level key is the
+/// namespace and the path, so two levels of one dimension type — a datapack
+/// `hoxy:test2` declared `minecraft:overworld`, next to the overworld — get
+/// one folder each, and `hoxy:test2` cannot collide with `hoxy_test2` or with
+/// the overworld's own `minecraft_overworld`.
+fn level_dir(root: &Path, level: &str) -> PathBuf {
+    root.join(sanitize_name(level))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,11 +266,80 @@ mod tests {
         std::env::temp_dir().join(format!("horizon-lss-client-{}", std::process::id()))
     }
 
+    /// A directory of its own: the other tests in this module delete
+    /// `temp_root()`, and a test that shares it loses its files mid-run.
+    fn temp_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("horizon-lss-client-{tag}-{}", std::process::id()))
+    }
+
     #[test]
     fn sanitize_dimension_folder_names() {
         assert_eq!(sanitize_name("minecraft:overworld"), "minecraft_overworld");
         assert_eq!(sanitize_name("still-fine.v2"), "still-fine.v2");
         assert_eq!(sanitize_name("Bad"), "_ad");
+    }
+
+    /// Two levels of one dimension type keep one folder each: the client keys
+    /// LSS by the level key, so a datapack `hoxy:test2` declared
+    /// `minecraft:overworld` does not share the overworld's store, and neither
+    /// does an `event` level under it.
+    #[test]
+    fn same_type_levels_get_separate_store_dirs() {
+        let root = PathBuf::from("/lss/mc.example");
+        let overworld = level_dir(&root, "minecraft:overworld");
+        let test2 = level_dir(&root, "hoxy:test2");
+        let event = level_dir(&root, "minecraft:event");
+        assert_eq!(overworld, root.join("minecraft_overworld"));
+        assert_eq!(test2, root.join("hoxy_test2"));
+        assert_eq!(event, root.join("minecraft_event"));
+        assert_ne!(
+            overworld, test2,
+            "two levels sharing a dimension type shared a store"
+        );
+        assert_ne!(event, test2);
+    }
+
+    /// Their columns are independent: columns written to one store are not
+    /// readable through the other, and the counts stay separate.
+    #[test]
+    fn same_type_levels_keep_independent_columns() {
+        use crate::lod::{Span, Surface};
+        use horizon_world::registry::BlockStateId;
+        let root = temp_dir("columns");
+        let _ = std::fs::remove_dir_all(&root);
+        let overworld = Store::open(level_dir(&root, "minecraft:overworld"), 11).unwrap();
+        let test2 = Store::open(level_dir(&root, "hoxy:test2"), 11).unwrap();
+        let columns: [Column; 256] = std::array::from_fn(|i| Column {
+            surface: Some(Surface {
+                height: 64 + (i % 3) as i32,
+                state: BlockStateId(i as u32),
+                water: None,
+                biome: 0,
+            }),
+            spans: vec![Span {
+                min: 0,
+                max: 1,
+                state: BlockStateId(i as u32),
+                biome: 0,
+                light: 240,
+            }]
+            .into(),
+        });
+        let coarse = crate::lod::coarse(&columns);
+        overworld.put((1, 0), 5, &columns, coarse.clone());
+        assert_eq!(overworld.len(), 1);
+        assert_eq!(
+            test2.len(),
+            0,
+            "one level's column was in the other's store"
+        );
+        assert!(test2.stamps().is_empty());
+        test2.put((2, 0), 9, &columns, coarse);
+        assert_eq!(overworld.len(), 1);
+        assert_eq!(test2.len(), 1);
+        assert_eq!(overworld.stamps(), vec![((1, 0), 5)]);
+        assert_eq!(test2.stamps(), vec![((2, 0), 9)]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

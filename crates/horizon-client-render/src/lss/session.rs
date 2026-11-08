@@ -163,8 +163,32 @@ impl Session {
         true
     }
 
-    pub fn on_response(&mut self, response: wire::Response, pos: (i32, i32)) {
-        if self.inner.dimension.is_none() || !in_range(pos, self.inner.center, self.distance()) {
+    /// An answer from the server's batch. `level` is the level the session is
+    /// streaming now; `lss:batch_response` carries no dimension, so an answer
+    /// that does not belong to this level is recognised by what this level
+    /// asked for — see the `in_flight` check below.
+    ///
+    /// One window stays open, and the wire cannot close it: an answer to a
+    /// request the level left had in flight for a position the level entered
+    /// also asks for carries no dimension and no request id, so it reads as
+    /// this level's. It settles a column this level never fetched, which then
+    /// reads as up to date and is not asked for again until a dirty notice or
+    /// a new `enter_dimension`. The terrain it costs is that one column in the
+    /// new level (each level has its own store, so no other level's bytes can
+    /// be shown); closing it needs a protocol change.
+    pub fn on_response(&mut self, level: &str, response: wire::Response, pos: (i32, i32)) {
+        if self.inner.dimension.as_deref() != Some(level) {
+            return;
+        }
+        if !in_range(pos, self.inner.center, self.distance()) {
+            return;
+        }
+        // Only this level's own requests are answered here. `enter_dimension`
+        // empties `in_flight` and `tick` refills it, so an answer to a request
+        // the previous level sent is dropped instead of settling a column this
+        // level never fetched (the two levels can share a dimension type and
+        // so the same coordinates).
+        if !self.inner.in_flight.contains(&pos) {
             return;
         }
         match response {
@@ -194,7 +218,13 @@ impl Session {
         }
     }
 
-    pub fn on_dirty(&mut self, positions: &[(i32, i32)]) {
+    /// A server dirty notice. `lss:dirty_columns` carries no dimension either,
+    /// so a notice is matched against the level that asked: a column this
+    /// level never fetched is not its terrain, whatever shares its coordinates.
+    pub fn on_dirty(&mut self, level: &str, positions: &[(i32, i32)]) {
+        if self.inner.dimension.as_deref() != Some(level) {
+            return;
+        }
         let distance = self.distance();
         for &pos in positions {
             if !in_range(pos, self.inner.center, distance) {
@@ -424,11 +454,11 @@ mod tests {
     fn classification_ladder() {
         let mut s = enabled_session(8);
         s.on_column("minecraft:overworld", (1, 0), 5);
-        s.on_dirty(&[(1, 0)]);
+        s.on_dirty("minecraft:overworld", &[(1, 0)]);
         let body = s.tick(0, 9999).expect("dirty resend");
         assert!(decode_batch(&body).contains(&((1, 0), 5)));
 
-        s.on_response(wire::Response::UpToDate, (2, 0));
+        s.on_response("minecraft:overworld", wire::Response::UpToDate, (2, 0));
         arm_scan(&mut s);
         let body = s.tick(0, 9999);
         assert!(body.is_none() || !decode_batch(&body.unwrap()).iter().any(|w| w.0 == (2, 0)));
@@ -475,15 +505,15 @@ mod tests {
     fn confirmed_ring_moves_with_settlement() {
         let mut s = enabled_session(1);
         let _ = s.tick(0, 9999);
-        s.on_response(wire::Response::UpToDate, (0, 0));
-        s.on_response(wire::Response::UpToDate, (1, 0));
-        s.on_response(wire::Response::UpToDate, (0, 1));
-        s.on_response(wire::Response::UpToDate, (1, 1));
-        s.on_response(wire::Response::UpToDate, (-1, 0));
-        s.on_response(wire::Response::UpToDate, (0, -1));
-        s.on_response(wire::Response::UpToDate, (-1, -1));
-        s.on_response(wire::Response::UpToDate, (1, -1));
-        s.on_response(wire::Response::UpToDate, (-1, 1));
+        s.on_response("minecraft:overworld", wire::Response::UpToDate, (0, 0));
+        s.on_response("minecraft:overworld", wire::Response::UpToDate, (1, 0));
+        s.on_response("minecraft:overworld", wire::Response::UpToDate, (0, 1));
+        s.on_response("minecraft:overworld", wire::Response::UpToDate, (1, 1));
+        s.on_response("minecraft:overworld", wire::Response::UpToDate, (-1, 0));
+        s.on_response("minecraft:overworld", wire::Response::UpToDate, (0, -1));
+        s.on_response("minecraft:overworld", wire::Response::UpToDate, (-1, -1));
+        s.on_response("minecraft:overworld", wire::Response::UpToDate, (1, -1));
+        s.on_response("minecraft:overworld", wire::Response::UpToDate, (-1, 1));
         arm_scan(&mut s);
         let _ = s.tick(0, 9999);
         assert!(s.stats().confirmed_ring > 0);
@@ -502,7 +532,7 @@ mod tests {
     fn dirty_reopens_and_redeclares_with_ts() {
         let mut s = enabled_session(2);
         s.on_column("minecraft:overworld", (2, 0), 50);
-        s.on_dirty(&[(2, 0)]);
+        s.on_dirty("minecraft:overworld", &[(2, 0)]);
         let body = s.tick(0, 9999).expect("scan");
         assert!(decode_batch(&body).contains(&((2, 0), 50)));
     }
@@ -510,7 +540,7 @@ mod tests {
     #[test]
     fn not_generated_not_redeclared() {
         let mut s = enabled_session(2);
-        s.on_response(wire::Response::NotGenerated, (5, 0));
+        s.on_response("minecraft:overworld", wire::Response::NotGenerated, (5, 0));
         arm_scan(&mut s);
         let body = s.tick(0, 9999);
         assert!(body.is_none() || !decode_batch(&body.unwrap()).contains(&((5, 0), -1)));
@@ -531,7 +561,7 @@ mod tests {
         s.set_view((0, 0), 0);
         let body = s.tick(0, 9999).expect("scan");
         assert!(decode_batch(&body).contains(&((1, 0), 99)));
-        s.on_response(wire::Response::UpToDate, (1, 0));
+        s.on_response("minecraft:overworld", wire::Response::UpToDate, (1, 0));
         arm_scan(&mut s);
         let body = s.tick(0, 9999);
         assert!(body.is_none() || !decode_batch(&body.unwrap()).iter().any(|w| w.0 == (1, 0)));
@@ -578,6 +608,81 @@ mod tests {
     fn other_dimension_column_rejected() {
         let mut s = enabled_session(2);
         assert!(!s.on_column("minecraft:the_nether", (0, 0), 1));
+    }
+
+    /// Two levels of one dimension type: `minecraft:overworld` and a datapack
+    /// level `hoxy:test2` that is declared `minecraft:overworld` too. The
+    /// level key separates their sessions, so an answer or a dirty notice that
+    /// belongs to the level just left is not applied to the one entered.
+    #[test]
+    fn same_type_levels_do_not_share_answers() {
+        let mut s = enabled_session(2);
+        let _ = s.tick(0, 9999);
+        // The overworld's request for (1, 0) is answered by the server...
+        s.on_response("minecraft:overworld", wire::Response::UpToDate, (1, 0));
+        assert_eq!(s.stats().up_to_date, 1);
+
+        // ...then the player enters the other overworld-type level at the same
+        // centre, so the same coordinates are wanted there. The server's answer
+        // to the overworld's request must not settle this level's column.
+        s.enter_dimension("hoxy:test2", []);
+        s.set_view((0, 0), 0);
+        let before = s.stats().up_to_date;
+        s.on_response("minecraft:overworld", wire::Response::UpToDate, (1, 0));
+        assert_eq!(
+            s.stats().up_to_date,
+            before,
+            "the level left answered for the level entered"
+        );
+        // The same level's own answer is taken.
+        let _ = s.tick(0, 9999);
+        s.on_response("hoxy:test2", wire::Response::UpToDate, (1, 0));
+        assert_eq!(s.stats().up_to_date, before + 1);
+    }
+
+    /// A column fetched in one level never becomes the other level's: entering
+    /// the second level starts its want-set from that level's own store.
+    #[test]
+    fn same_type_levels_do_not_share_columns() {
+        let mut s = enabled_session(2);
+        s.on_column("minecraft:overworld", (1, 0), 5);
+        assert_eq!(s.stats().known, 1);
+
+        s.enter_dimension("hoxy:test2", []);
+        s.set_view((0, 0), 0);
+        assert_eq!(s.stats().known, 0, "the other level's column stayed");
+        // Its store has its own stamps, and they are what it starts from.
+        s.enter_dimension("hoxy:test2", [((1, 0), 7)]);
+        s.set_view((0, 0), 0);
+        let body = s.tick(0, 9999).expect("scan");
+        assert!(decode_batch(&body).contains(&((1, 0), 7)));
+    }
+
+    /// A dirty notice carries no dimension. The level streamed now only
+    /// reopens columns it holds, so the level left's notice cannot re-request
+    /// this level's terrain.
+    #[test]
+    fn same_type_levels_do_not_share_dirty_notices() {
+        let mut s = enabled_session(2);
+        let _ = s.tick(0, 9999);
+        s.on_response("minecraft:overworld", wire::Response::UpToDate, (0, 0));
+        assert_eq!(s.stats().up_to_date, 1);
+
+        // The other overworld-type level, settled at the same coordinates.
+        s.enter_dimension("hoxy:test2", []);
+        s.set_view((0, 0), 0);
+        let _ = s.tick(0, 9999);
+        s.on_response("hoxy:test2", wire::Response::UpToDate, (0, 0));
+        assert_eq!(s.stats().up_to_date, 2);
+
+        // The overworld's notice for the same coordinates is not this level's.
+        s.on_dirty("minecraft:overworld", &[(0, 0)]);
+        arm_scan(&mut s);
+        let body = s.tick(0, 9999);
+        assert!(
+            body.is_none() || !decode_batch(&body.unwrap()).iter().any(|w| w.0 == (0, 0)),
+            "the level left's dirty notice re-requested the level entered's column"
+        );
     }
 
     #[test]
