@@ -1990,6 +1990,10 @@ impl Lod {
     /// already dirty through its selection change.
     fn refresh_ready(&mut self, key: TileKey, existed: bool) {
         self.refresh_path(key);
+        // A tile that stays active keeps its place in `mesh_samples`, which
+        // `refresh_path` only follows across a selection change: replaced
+        // samples would leave the snapshot on the old ones.
+        self.sync_sample(key);
         if existed {
             self.mark_data_changed(key);
         }
@@ -4101,6 +4105,46 @@ mod tests {
         );
         lod.apply_detail(chunk, &columns());
         assert_eq!(lod.shared.detail_widths.load(Ordering::Relaxed), 0b10);
+    }
+    /// A chunk's columns arriving again for a tile already drawn replace its
+    /// samples: the mesh snapshot must follow them, or the next batch meshes
+    /// the terrain it replaced (`check_mesh_samples`).
+    #[test]
+    fn columns_arriving_again_keep_the_mesh_snapshot_in_step() {
+        let mut lod = Lod::scheduler_for_test();
+        let key = TileKey {
+            x: 0,
+            z: 0,
+            level: 0,
+        };
+        lod.plan = Plan::default();
+        lod.plan.roots = vec![key];
+        lod.plan.nodes.insert(key);
+        let column = |height: i32| {
+            Column::from_surface(Some(Surface {
+                height,
+                state: BlockStateId(1),
+                water: None,
+                biome: 0,
+            }))
+        };
+        let reduced =
+            |height: i32| ReducedColumns::new(Arc::new(std::array::from_fn(|_| column(height))));
+        lod.apply_columns((0, 0), &reduced(64), &column(64));
+        lod.check_mesh_samples();
+        // The same chunk again, changed: its samples are replaced.
+        lod.apply_columns((0, 0), &reduced(70), &column(70));
+        lod.check_mesh_samples();
+        assert_eq!(
+            lod.mesh_samples.get(&key).map(|samples| samples[0].surface),
+            Some(Some(Surface {
+                height: 70,
+                state: BlockStateId(1),
+                water: None,
+                biome: 0,
+            })),
+            "the snapshot holds the columns that arrived last"
+        );
     }
     /// Detail read before a refresh over its chunk is dropped (asked
     /// again); elsewhere, or read after, it is kept.
