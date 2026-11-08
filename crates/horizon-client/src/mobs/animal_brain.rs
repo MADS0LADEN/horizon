@@ -71,6 +71,10 @@ impl<T> Slot<T> {
     pub fn present(&self) -> bool {
         self.v.is_some()
     }
+    /// `MemorySlot.timeToLive`: `i64::MAX` denotes a permanent memory.
+    pub fn ttl(&self) -> i64 {
+        self.ttl
+    }
 }
 impl<T: Clone> Slot<T> {
     pub fn value(&self) -> Option<T> {
@@ -279,6 +283,8 @@ pub enum Kind {
     Ghastling,
     /// `CopperGolemAi`.
     CopperGolem,
+    /// `TadpoleAi`.
+    Tadpole,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -316,6 +322,14 @@ impl Kind {
                 Sensor::Players,
             ],
             Kind::CopperGolem => &[Sensor::Living, Sensor::HurtBy],
+            // `Tadpole.SENSOR_TYPES`: the living entities, the players, what hurt it and
+            // the frog food players hold.
+            Kind::Tadpole => &[
+                Sensor::Living,
+                Sensor::Players,
+                Sensor::HurtBy,
+                Sensor::Tempting,
+            ],
         }
     }
 }
@@ -363,6 +377,7 @@ fn kind_for_species(species: Species) -> Option<Kind> {
         // Every happy ghast has the brain; only the ghastling's ticks.
         Species::HappyGhast => Some(Kind::Ghastling),
         Species::CopperGolem => Some(Kind::CopperGolem),
+        Species::Tadpole => Some(Kind::Tadpole),
         _ => None,
     }
 }
@@ -393,6 +408,7 @@ pub fn init(m: &mut Mob, shuffle_seed: i64) {
         Kind::Sniffer => sniffer_package(shuffle_seed),
         Kind::Ghastling => ghastling_package(shuffle_seed),
         Kind::CopperGolem => copper_golem_package(shuffle_seed),
+        Kind::Tadpole => tadpole_package(shuffle_seed),
     };
     if let Some(c) = cooldown {
         b.mem.transport_items_cooldown_ticks.set(c);
@@ -533,7 +549,8 @@ fn update_activity(m: &mut Mob) {
     let order: &[Act] = match b.kind {
         Kind::Sniffer => &[Act::Dig, Act::Sniff, Act::Idle],
         Kind::Ghastling => &[Act::Panic, Act::Idle],
-        Kind::CopperGolem => &[Act::Idle],
+        // `TadpoleAi.updateActivity`: `setActiveActivityToFirstValid(IDLE)`.
+        Kind::CopperGolem | Kind::Tadpole => &[Act::Idle],
         Kind::Axolotl => unreachable!(),
     };
     for &a in order {
@@ -628,7 +645,7 @@ fn targetable(m: &mut Mob, w: &MobWorld, who: Who) -> bool {
             // TargetingConditions.forNonCombat(): in range (scaled by the
             // player's visibility, at least 2) and in sight.
             let Some(p) = &w.player else { return false };
-            let r = (range * p.visibility_percent()).max(2.0);
+            let r = (range * p.visibility_percent(Some(m.kind.id.as_str()), w.items)).max(2.0);
             p.alive && !p.spectator && m.distance_sqr(p.position) <= r * r && m.sees(w, who)
         }
         Who::Mob(id) => {
@@ -1363,7 +1380,7 @@ impl B {
                 let Some(t) = found else { return false };
                 // Ticker.tickDownAndCheck (UniformInt 40..80 on the level random).
                 if *ticks == 0 {
-                    *ticks = if m.species() == Species::Axolotl {
+                    *ticks = if matches!(m.species(), Species::Axolotl | Species::Tadpole) {
                         30 + cx.lr.next_int_bound(31).unwrap_or(0) - 1
                     } else {
                         40 + cx.lr.next_int_bound(41).unwrap_or(0) - 1
@@ -1593,13 +1610,16 @@ impl B {
                         // Sniffer.spawnChildFromBreeding: the experience
                         // (finalizeSpawnChildFromBreeding), then the plop,
                         // both from the parent's random; the game lays the
-                        // egg.
+                        // egg. Vanilla makes the draw inside the `mob_drops`
+                        // check, so it is skipped with the rule off.
                         let at = [m.position.x, m.position.y, m.position.z];
-                        let xp = 1 + m.random.next_int_bound(7).unwrap_or(0);
-                        cx.events.push(MobEvent::Experience {
-                            at,
-                            amount: xp as u32,
-                        });
+                        if cx.w.mob_drops {
+                            let xp = 1 + m.random.next_int_bound(7).unwrap_or(0);
+                            cx.events.push(MobEvent::Experience {
+                                at,
+                                amount: xp as u32,
+                            });
+                        }
                         let pitch = (m.random.next_float() - m.random.next_float()) * 0.2 + 0.5;
                         cx.events
                             .push(MobEvent::Sound("block.sniffer_egg.plop", at, 1.0, pitch));
@@ -1945,7 +1965,8 @@ fn follow_temptation_close(m: &mut Mob) -> f64 {
                 3.5
             }
         }
-        Kind::Axolotl => 2.5,
+        // `new FollowTemptation(speed)`: the default close-enough distance, 2.5.
+        Kind::Axolotl | Kind::Tadpole => 2.5,
         Kind::Ghastling | Kind::CopperGolem => 3.0,
     }
 }
@@ -2272,6 +2293,9 @@ enum AxolotlAction {
     FindLiquid,
     SwimStroll,
     WalkFromLook,
+    /// `SetWalkTargetFromLookTarget.create(0.5, 3)` of the tadpole: no condition on the
+    /// water, a fixed speed.
+    TadpoleWalkFromLook,
     StayWater,
     StayGround,
 }
@@ -2409,7 +2433,7 @@ fn axolotl_action(m: &mut Mob, cx: &mut Bx, action: AxolotlAction, until: &mut i
             if cx
                 .w
                 .target_info(target)
-                .is_some_and(|t| m.within_melee_range(&t))
+                .is_some_and(|t| m.within_melee_range(cx.w, &t))
                 && visible_contains(m, cx.w, target)
             {
                 mem(m).walk_target.clear();
@@ -2436,7 +2460,7 @@ fn axolotl_action(m: &mut Mob, cx: &mut Bx, action: AxolotlAction, until: &mut i
                 || !cx
                     .w
                     .target_info(target)
-                    .is_some_and(|t| m.within_melee_range(&t))
+                    .is_some_and(|t| m.within_melee_range(cx.w, &t))
             {
                 return false;
             }
@@ -2605,9 +2629,76 @@ fn axolotl_action(m: &mut Mob, cx: &mut Bx, action: AxolotlAction, until: &mut i
             });
             true
         }
+        TadpoleWalkFromLook => {
+            if mem(m).walk_target.present() {
+                return false;
+            }
+            let Some(t) = mem(m).look_target.value() else {
+                return false;
+            };
+            mem(m).walk_target.set(WalkTarget {
+                target: t,
+                speed: 0.5,
+                close: 3,
+            });
+            true
+        }
         StayWater => m.fluids.in_water,
         StayGround => m.on_ground,
     }
+}
+/// `TadpoleAi`: the core activity (panic 2.0, the look and move sinks, the temptation
+/// cooldown) and the idle one (look at a player now and then, follow frog food at 1.25,
+/// then swim about, walk to what it looks at, or stay put in water).
+fn tadpole_package(seed: i64) -> Vec<Entry> {
+    use Act::*;
+    use AxolotlAction::*;
+    let e = |act, b| Entry { act, b };
+    let action = |action| B::AxolotlAction {
+        action,
+        running: false,
+        until: 0,
+    };
+    vec![
+        // Priority 0.
+        e(
+            Core,
+            B::AnimalPanic {
+                t: Timed::new(100, 120),
+                fly: false,
+                speed: 2.0,
+            },
+        ),
+        e(Idle, B::LookAtPlayerSometimes(false, 0)),
+        // Priority 1.
+        e(Core, B::LookAtTargetSink(Timed::new(45, 90))),
+        e(
+            Idle,
+            B::FollowTemptation {
+                t: Timed::new(60, 60),
+                look_in_the_eyes: false,
+            },
+        ),
+        // Priority 2.
+        e(Core, move_to_target_sink(150, 250)),
+        e(
+            Idle,
+            B::Gate(Box::new(Gate {
+                running: false,
+                shuffle: false,
+                try_all: true,
+                random: horizon_core::random::LegacyRandom::new(seed),
+                kids: vec![
+                    (action(SwimStroll), 2, 0.0),
+                    (action(TadpoleWalkFromLook), 3, 0.0),
+                    (action(StayWater), 5, 0.0),
+                ],
+                when: Some(|mm| !mm.walk_target.present()),
+            })),
+        ),
+        // Priority 3.
+        e(Core, B::CountDownTemptation(Timed::new(60, 60))),
+    ]
 }
 fn axolotl_package(seed: i64) -> Vec<Entry> {
     use Act::*;

@@ -4,6 +4,7 @@ use crate::chunk::{self, BIOME_STRATEGY, Chunk, ColumnLayout, Light, Section, sh
 use crate::fast_hash::FxHashMap;
 use horizon_core::paletted::PalettedContainer;
 use horizon_protocol::buf::Reader;
+use horizon_world::block_state_properties::BlockProperties;
 use horizon_world::chunk::BlockState;
 use horizon_world::registry::BlockRegistry;
 use std::collections::BTreeMap;
@@ -433,11 +434,14 @@ fn parse_identity(identity: &str) -> Option<(String, BTreeMap<String, String>)> 
 
 fn resolve_block_identity(registry: &BlockRegistry, identity: &str) -> u32 {
     let state = if let Some((name, properties)) = parse_identity(identity) {
-        BlockState { name, properties }
+        BlockState {
+            name,
+            properties: properties.into(),
+        }
     } else {
         BlockState {
             name: identity.to_owned(),
-            properties: BTreeMap::new(),
+            properties: BlockProperties::new(),
         }
     };
     if let Some(id) = registry.id(&state) {

@@ -65,14 +65,32 @@ pub fn state(enabled: &[Mod], built: Option<&[Mod]>) -> State {
 pub struct Build {
     /// The release or Nightly it was built on (`native_mods::About::base`).
     pub base: String,
+    /// The Horizon commit it compiled.
+    pub horizon: String,
+    /// The mods whose pin made it compile `horizon` rather than `base`'s own commit.
+    pub pinned_by: Vec<String>,
+    /// It compiled another commit than its Nightly's, with no record of why: built before the
+    /// launcher kept which mods pinned it ([`pinning`] reads them from the instance's mods).
+    pub pinned_unknown: bool,
+    /// The mods turned on that it was built without, and why.
+    pub left_out: Vec<native_mods::LeftOut>,
 }
 
 impl Build {
     /// Installed native build `version`'s, from its `native-mods.json`; None for another version.
     pub fn read(version: &str) -> Option<Build> {
-        Some(Build {
-            base: native_mods::about(version)?.base,
-        })
+        Some(Build::of(native_mods::about(version)?))
+    }
+
+    /// What build record `about` says.
+    fn of(about: native_mods::About) -> Build {
+        Build {
+            pinned_unknown: about.off_its_nightly(),
+            base: about.base,
+            horizon: about.horizon,
+            pinned_by: about.pinned_by,
+            left_out: about.left_out,
+        }
     }
 
     /// The Horizon it was built on, as a player reads it (`horizon_label`).
@@ -119,6 +137,60 @@ pub fn enabled(home: &Path) -> Vec<Mod> {
     out
 }
 
+/// The native mods turned on in game folder `home` that pin Horizon commit `revision` (those naming
+/// a hook points' version follow the others, so they pin nothing).
+pub fn pinning(home: &Path, revision: &str) -> Vec<String> {
+    bundles_on(home)
+        .into_iter()
+        .filter(|b| b.manifest.hooks.is_none() && b.manifest.horizon == revision)
+        .map(|b| b.manifest.id)
+        .collect()
+}
+
+/// The readable native mods turned on in game folder `home`.
+pub fn bundles_on(home: &Path) -> Vec<horizon_mods::index::native::Bundle> {
+    hnmods(home)
+        .into_iter()
+        .filter_map(|path| horizon_mods::index::native::Bundle::read(&path).ok())
+        .filter(|b| java::is_enabled(home, &b.manifest.id))
+        .collect()
+}
+
+/// A native file not tracked by the registry/browser, including GitHub installs.
+#[derive(Clone)]
+pub struct Installed {
+    pub file: String,
+    pub id: String,
+    pub version: String,
+    pub origin: Option<crate::github_mods::Origin>,
+}
+
+/// Discover the actual files, not just GitHub sidecars. Registry files already have a row.
+pub fn untracked(home: &Path) -> Vec<Installed> {
+    let tracked = crate::browser::installed::Installed::load(home);
+    hnmods(home)
+        .into_iter()
+        .filter_map(|path| {
+            let file = format!("{}/{}", native_mods::INSTALLED, path.file_name()?.to_str()?);
+            if !path.is_file() || tracked.entries.iter().any(|e| e.file == file) {
+                return None;
+            }
+            let (id, version) = horizon_mods::index::native::Bundle::read(&path)
+                .map(|b| (b.manifest.id, b.manifest.version))
+                .unwrap_or_else(|_| (stem(&path), String::new()));
+            let origin = (path.file_stem()?.to_str()? == id)
+                .then(|| crate::github_mods::origin(home, &id))
+                .flatten();
+            Some(Installed {
+                file,
+                id,
+                version,
+                origin,
+            })
+        })
+        .collect()
+}
+
 /// The mods installed version `version` was built with, or None when it isn't a native build
 /// (or its `native-mods.json` can't be read: the Mods page then offers Build).
 pub fn built(version: &str) -> Option<Vec<Mod>> {
@@ -130,9 +202,16 @@ pub fn built(version: &str) -> Option<Vec<Mod>> {
     Some(parse_built(&about))
 }
 
+/// The mods a build was made for: those it holds and those it left out (a build already tried
+/// them: it is up to date with the same mods turned on).
 fn parse_built(about: &serde_json::Value) -> Vec<Mod> {
     let mods = about["mods"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let left_out = about["left_out"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
     mods.iter()
+        .chain(left_out)
         .filter_map(|m| {
             Some((
                 m["id"].as_str()?.into(),
@@ -149,7 +228,11 @@ pub fn fingerprint(home: &Path, version: Option<&str>) -> String {
     let mut out = format!("{}\n{version:?}\n", home.display());
     // The on/off list (`browser::java::is_enabled`).
     out += &fs::read_to_string(home.join("horizon-mods.txt")).unwrap_or_default();
-    for path in hnmods(home) {
+    for path in hnmods(home)
+        .into_iter()
+        .flat_map(|p| [p.clone(), p.with_extension("origin.json")])
+        .chain([home.join("mod-browser.json")])
+    {
         let meta = fs::metadata(&path).ok();
         let time = meta.as_ref().and_then(|m| m.modified().ok());
         out += &format!("\n{} {:?} {time:?}", path.display(), meta.map(|m| m.len()));
@@ -182,6 +265,110 @@ mod tests {
 
     fn d(id: &str, version: &str, digest: &str) -> Mod {
         (id.into(), version.into(), Some(digest.into()))
+    }
+
+    #[test]
+    fn github_and_local_files_are_listed_once_and_drive_build_state() {
+        use crate::browser::{installed, Kind, SourceId};
+        use std::io::Write;
+        let home = std::env::temp_dir().join(format!("native-list-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(home.join(native_mods::INSTALLED)).unwrap();
+        let pin = "a".repeat(40);
+        for (file, id) in [
+            ("registry", "registry"),
+            ("github", "github"),
+            ("renamed", "local"),
+        ] {
+            let path = home
+                .join(native_mods::INSTALLED)
+                .join(format!("{file}.hnmod"));
+            let mut zip = zip::ZipWriter::new(fs::File::create(path).unwrap());
+            let manifest = serde_json::json!({"schema":1,"id":id,"version":"1.2","game":"26.3","horizon":pin,"mixins":pin});
+            let source = format!("[mod]\nid = \"{id}\"\nversion = \"1.2\"\n[compatibility]\nhorizon_revision = \"{pin}\"\n");
+            for (name, bytes) in [
+                ("horizon-native.json".into(), manifest.to_string()),
+                (format!("mixins/{id}/horizon-mixin.toml"), source),
+            ] {
+                zip.start_file(name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                zip.write_all(bytes.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let record = crate::github_mods::Origin {
+            id: "github".into(),
+            version: "1.2".into(),
+            owner: "example".into(),
+            repo: "mods".into(),
+            tag: None,
+            commit: pin,
+            asset: None,
+            sha256: "ab".repeat(32),
+        };
+        fs::write(
+            home.join(native_mods::INSTALLED).join("github.origin.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        installed::Installed {
+            entries: vec![installed::Entry {
+                source: SourceId::Horizon,
+                project: "registry".into(),
+                slug: "registry".into(),
+                title: "Registry mod".into(),
+                kind: Kind::Mod,
+                version: "1.2".into(),
+                number: "1.2".into(),
+                file: format!("{}/registry.hnmod", native_mods::INSTALLED),
+                checksum: String::new(),
+                page: String::new(),
+                dependency: false,
+                verdict: None,
+                skipped: vec![],
+                namespaces: vec![],
+            }],
+        }
+        .save(&home)
+        .unwrap();
+        let files = untracked(&home);
+        let seen: Vec<_> = files
+            .iter()
+            .map(|m| (m.id.as_str(), m.version.as_str(), m.origin.is_some()))
+            .collect();
+        assert_eq!(seen, [("github", "1.2", true), ("local", "1.2", false)]);
+        for id in ["registry", "github", "local"] {
+            java::set_enabled(&home, id, true).unwrap();
+        }
+        assert_eq!(state(&enabled(&home), None), State::NotBuilt);
+        for id in ["registry", "github", "local"] {
+            java::set_enabled(&home, id, false).unwrap();
+        }
+        assert_eq!(state(&enabled(&home), None), State::NoMods);
+        assert_eq!(
+            untracked(&home).len(),
+            2,
+            "disabled mods remain in the list"
+        );
+        let before = fingerprint(&home, None);
+        fs::remove_file(home.join(&files[0].file)).unwrap();
+        assert_ne!(before, fingerprint(&home, None));
+        assert_eq!(
+            untracked(&home).len(),
+            1,
+            "a stale origin is not an installed mod"
+        );
+        fs::write(
+            home.join(native_mods::INSTALLED).join("broken.hnmod"),
+            b"broken",
+        )
+        .unwrap();
+        assert_eq!(
+            untracked(&home)[0].id,
+            "broken",
+            "unreadable files can still be removed"
+        );
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
@@ -237,6 +424,17 @@ mod tests {
         });
         assert_eq!(parse_built(&about), [m("zoom", "2.1"), d("y", "1", "ab")]);
         assert!(parse_built(&serde_json::json!({})).is_empty());
+        // A mod the build left out was tried: the same mods turned on need no new build, a new
+        // version of it does.
+        let about = serde_json::json!({
+            "mods": [{"id": "zoom", "version": "2.1"}],
+            "left_out": [{"id": "hitbox_plus", "version": "1.3.0", "why": "other-version"}],
+        });
+        let build = parse_built(&about);
+        let on = [m("zoom", "2.1"), m("hitbox_plus", "1.3.0")];
+        assert_eq!(state(&on, Some(build.as_slice())), State::UpToDate);
+        let on = [m("zoom", "2.1"), m("hitbox_plus", "1.3.1")];
+        assert_eq!(state(&on, Some(build.as_slice())), State::Outdated);
         assert_eq!(built("v0.1.0"), None, "not a native build");
     }
 
@@ -250,14 +448,39 @@ mod tests {
         assert_eq!(horizon_label("nightly-2026-10-29"), "Nightly 2026-10-29");
         let build = Build {
             base: "nightly-2026-10-28-0c02067".into(),
+            ..Build::default()
         };
         assert_eq!(build.horizon(), "Nightly 2026-10-28");
         assert_eq!(build.horizon_short(), "Nightly 10-28");
         let release = Build {
             base: "v0.2.93".into(),
+            ..Build::default()
         };
         assert_eq!(release.horizon_short(), "v0.2.93");
         assert_eq!(Build::read("v0.1.0"), None, "not a native build");
+    }
+
+    /// A build from before pins were recorded that compiled another commit than its Nightly's
+    /// was pinned by a mod (the Mods page then reads which from the instance's mods); one on its
+    /// Nightly's commit, a release's, or a newer record's, says itself.
+    #[test]
+    fn an_older_build_off_its_nightlys_commit_was_pinned() {
+        let about = |base: &str, horizon: &str, base_horizon: Option<&str>| native_mods::About {
+            base: base.into(),
+            horizon: horizon.into(),
+            target: native_mods::Target::Client,
+            base_horizon: base_horizon.map(str::to_owned),
+            pinned_by: Vec::new(),
+            on_base: false,
+            left_out: Vec::new(),
+        };
+        let pin = "9d979caa48a3bb58203319b9ea044db58c38e0d8";
+        let own = "d91cab6000000000000000000000000000000000";
+        let nightly = "nightly-2026-11-01-d91cab6";
+        assert!(Build::of(about(nightly, pin, None)).pinned_unknown);
+        assert!(!Build::of(about(nightly, own, None)).pinned_unknown);
+        assert!(!Build::of(about("v0.2.93", pin, None)).pinned_unknown);
+        assert!(!Build::of(about(nightly, pin, Some(pin))).pinned_unknown);
     }
 
     #[test]

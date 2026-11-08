@@ -10,10 +10,13 @@ use super::{
 };
 use crate::items::ItemStack;
 use crate::projectiles::{Projectile, ProjectileKind};
-use horizon_core::geometry::trig::Mth;
+use horizon_core::geometry::trig::{DEG_TO_RAD, Mth};
 use horizon_core::{geometry::Vec3, random::RandomSource};
 use std::f32::consts::PI;
 
+/// The target selector of `Pillager.registerGoals`,
+/// `Vindicator.registerGoals` and `Evoker.registerGoals`; the evoker's player
+/// and villager goals keep an unseen target 300 ticks (`setUnseenMemoryTicks`).
 fn targets(m: &mut Mob, villagers_seen: bool) {
     let mut hurt = HurtByTarget::new().alert();
     hurt.ignore = vec![
@@ -26,13 +29,20 @@ fn targets(m: &mut Mob, villagers_seen: bool) {
         Species::Ravager,
     ];
     m.ai.targets.add(1, hurt);
-    m.ai.targets.add(2, NearestTarget::player(true));
+    let memory = if m.species() == Species::Evoker {
+        300
+    } else {
+        60
+    };
+    m.ai.targets
+        .add(2, NearestTarget::player(true).unseen_memory(memory));
     m.ai.targets.add(
         3,
         NearestTarget::species(
             &[Species::Villager, Species::WanderingTrader],
             villagers_seen,
-        ),
+        )
+        .unseen_memory(memory),
     );
     m.ai.targets
         .add(3, NearestTarget::species(&[Species::IronGolem], true));
@@ -69,18 +79,26 @@ pub fn register_vindicator(m: &mut Mob) {
     g.add(9, LookAtPlayer::new(3.0).probability(1.0));
     g.add(10, LookAtPlayer::mobs(8.0));
     targets(m, true);
-    // VindicatorJohnnyAttackGoal: a vindicator named Johnny attacks any
-    // living entity, other raiders included.
+    // VindicatorJohnnyAttackGoal: a vindicator that was named Johnny attacks
+    // any living entity, other raiders included. The flag is a latch
+    // (`Vindicator.setCustomName` sets it and never clears it), not the name in
+    // front of the mob now, so a rename keeps the goal.
     m.ai.targets.add(
         4,
         NearestTarget::new(Prey::Filter(|_| true), true)
             .interval(0)
-            .when(|m, _| m.custom_name.as_deref() == Some("Johnny")),
+            .when(|m, _| m.extra.johnny),
     );
 }
 /// `Vindicator.customServerAiStep`: its navigation opens doors while a raid
 /// is at its position.
 pub fn vindicator_server_ai_step(m: &mut Mob) {
+    // `Vindicator.setCustomName`'s latch, taken from the live name: a name that
+    // became `Johnny` sets it, and nothing clears it (`addAdditionalSaveData`
+    // saves it for the next load).
+    if m.custom_name.as_deref() == Some("Johnny") {
+        m.extra.johnny = true;
+    }
     if super::doors::can_navigate_ground(m) {
         m.ai.nav.can_open_doors = super::raider::state(m).is_some_and(|s| s.raided);
     }
@@ -110,6 +128,42 @@ enum Spell {
     Vexes = 1,
     Fangs = 2,
     Wololo = 3,
+}
+/// `IllagerSpell.spellColor` as `(float)` red, green and blue, by spell id
+/// (1 summon vex, 2 fangs, 3 wololo, 4 disappear, 5 blindness).
+fn spell_color(id: u8) -> [f32; 3] {
+    match id {
+        1 => [0.7, 0.7, 0.8],
+        2 => [0.4, 0.3, 0.35],
+        3 => [0.7, 0.5, 0.2],
+        4 => [0.3, 0.3, 0.8],
+        5 => [0.1, 0.1, 0.2],
+        _ => [0.0; 3],
+    }
+}
+/// The client half of `SpellcasterIllager.tick`: while the casting-spell data
+/// is above 0, two `entity_effect` particles in the spell's colour, one at each
+/// hand, which swing with the body and a wobble of the age.
+pub fn cast_particles(m: &Mob, events: &mut Vec<MobEvent>) {
+    if m.extra.variant2 == 0 {
+        return;
+    }
+    let [r, g, b] = spell_color(m.extra.variant2);
+    let angle = m.body_yaw * DEG_TO_RAD + (m.age as f32 * 0.6662).mcos() * 0.25;
+    let (cos, sin) = (f64::from(angle.mcos()), f64::from(angle.msin()));
+    let scale = super::riders::scale(m);
+    let (reach, height) = (0.6 * scale, 1.8 * scale);
+    let p = m.position;
+    for side in [1.0, -1.0] {
+        events.push(MobEvent::ParticleColored {
+            at: [
+                p.x + side * cos * reach,
+                p.y + height,
+                p.z + side * sin * reach,
+            ],
+            color: [r, g, b],
+        });
+    }
 }
 /// `SpellcasterCastingSpellGoal`: stand still facing the target while a
 /// spell is cast.
@@ -299,6 +353,17 @@ fn summon_vexes(m: &mut Mob, cx: &mut Cx) {
                 ..Default::default()
             },
         });
+        // `serverLevel.gameEvent(ENTITY_PLACE, pos, Context.of(evoker))` after each vex.
+        cx.events.push(MobEvent::GameEvent {
+            event: "minecraft:entity_place",
+            at: [
+                f64::from(p[0]) + 0.5,
+                f64::from(p[1]) + 0.5,
+                f64::from(p[2]) + 0.5,
+            ],
+            source: m.id,
+            state: horizon_world::registry::BlockStateId(0),
+        });
     }
 }
 /// `EvokerAttackSpellGoal.performSpellCasting`: a ring of fangs when the
@@ -352,14 +417,18 @@ fn cast_fangs(m: &mut Mob, cx: &mut Cx) {
         }
     }
 }
-/// `createSpellEntity`: the first sturdy floor going down from `max_y`,
-/// standing on the top of any block in the way.
+/// `createSpellEntity`: the first block below `max_y` whose up face is
+/// sturdy, standing on the top of whatever collision shape is in the way.
+///
+/// The floor test is `BlockState.isFaceSturdy(.., UP)`, not a full cube: a
+/// soul sand or mud block is 14/16 high and still supports a fang, where
+/// requiring a full collision shape drops the fang into the block.
 fn fang_floor(w: &super::MobWorld, x: f64, z: f64, min_y: f64, max_y: f64) -> Option<f64> {
     let (bx, bz) = (x.floor() as i32, z.floor() as i32);
     let mut y = max_y.floor() as i32;
     while y >= min_y.floor() as i32 - 1 {
-        let below = w.facts.get(w.world.block(bx, y - 1, bz));
-        if below.full_collision {
+        let below = w.world.block(bx, y - 1, bz);
+        if w.data.state(below).flags & super::data::STURDY_TOP != 0 {
             let here = w.world.block(bx, y, bz);
             let top = if w.facts.is_air(here) {
                 0.0
@@ -524,14 +593,21 @@ impl Goal for CrossbowAttack {
                     m.extra.using_item = 0;
                     m.extra.flag = false;
                     self.state = Crossbow::Charged;
+                    let weapon = m
+                        .extra
+                        .main_hand_stack()
+                        .cloned()
+                        .unwrap_or_else(|| ItemStack::new("minecraft:crossbow", 1));
                     set_crossbow_charged(m, true);
+                    // The attack delay is drawn before the sound's pitch, as before.
                     self.attack_delay = 20 + m.random.next_int_bound(20).unwrap_or(0);
-                    cx.events.push(MobEvent::Sound(
-                        "item.crossbow.loading_end",
-                        m.center(),
-                        1.0,
-                        1.0 / (m.random.next_float() * 0.5 + 1.0) + 0.2,
-                    ));
+                    let pitch = 1.0 / (m.random.next_float() * 0.5 + 1.0) + 0.2;
+                    cx.events.push(MobEvent::CrossbowLoad {
+                        mob: m.id,
+                        at: m.center(),
+                        pitch,
+                        weapon,
+                    });
                 }
             }
             Crossbow::Charged => {
@@ -556,6 +632,15 @@ fn shoot_crossbow(m: &mut Mob, who: Who, cx: &mut Cx) {
     let Some(t) = cx.w.target_info(who) else {
         return;
     };
+    // CrossbowItem.shootAll: only the charged projectile flies.
+    let Some(ammo) = m
+        .extra
+        .main_hand_stack()
+        .and_then(|s| s.data())
+        .and_then(|d| d.charged.first().cloned())
+    else {
+        return;
+    };
     let start = Vec3::new(m.position.x, m.eye_y() - 0.1, m.position.z);
     let dx = t.position.x - m.position.x;
     let dz = t.position.z - m.position.z;
@@ -575,12 +660,12 @@ fn shoot_crossbow(m: &mut Mob, who: Who, cx: &mut Cx) {
     p.set_bonus(super::gear::arrow_bonus(m));
     // rangedAttackUncertainty: 14 - 4 * difficulty.
     p.shoot(
-        &mut crate::projectiles::own_random(m),
+        &mut crate::random_source::entity(),
         [dx, dy, dz],
         1.6,
         (14 - i32::from(cx.w.difficulty.id) * 4) as f32,
     );
-    cx.events.push(MobEvent::Projectile(p));
+    cx.events.push(MobEvent::CrossbowShot { ammo, arrow: p });
     let pitch = 1.0 / (m.random.next_float() * 0.5 + 1.8) + 0.53;
     cx.events.push(MobEvent::Sound(
         "item.crossbow.shoot",
@@ -802,6 +887,102 @@ mod tests {
     use crate::mobs::sensor_scan_tests::kind;
     use std::sync::Arc;
 
+    fn evoker(spell: u8) -> Mob {
+        let mut kind = kind();
+        let k = Arc::make_mut(&mut kind);
+        k.id = "minecraft:evoker".into();
+        k.species = Species::Evoker;
+        let mut m = Mob::new(1, kind, Vec3::new(10.0, 64.0, -5.0), 0.0);
+        m.extra.variant2 = spell;
+        m.body_yaw = 90.0;
+        m.age = 7;
+        m
+    }
+
+    /// `SpellcasterIllager.tick`: two coloured particles at the hands while a
+    /// spell is cast, none otherwise; the colours are `IllagerSpell.spellColor`.
+    #[test]
+    fn a_casting_evoker_has_a_particle_in_each_hand() {
+        let mut events = Vec::new();
+        cast_particles(&evoker(0), &mut events);
+        assert!(events.is_empty());
+        for (id, want) in [
+            (1, [0.7, 0.7, 0.8]),
+            (2, [0.4, 0.3, 0.35]),
+            (3, [0.7, 0.5, 0.2]),
+            (4, [0.3, 0.3, 0.8]),
+            (5, [0.1, 0.1, 0.2]),
+        ] {
+            events.clear();
+            cast_particles(&evoker(id), &mut events);
+            assert_eq!(events.len(), 2);
+            let hands: Vec<([f64; 3], [f32; 3])> = events
+                .iter()
+                .map(|e| match e {
+                    MobEvent::ParticleColored { at, color } => (*at, *color),
+                    _ => panic!("not a coloured particle"),
+                })
+                .collect();
+            assert_eq!(hands[0].1, want);
+            assert_eq!(hands[1].1, want);
+            // Both at y + 1.8, mirrored about the mob, 0.6 away.
+            assert!((hands[0].0[1] - 65.8).abs() < 1e-9);
+            assert!((hands[0].0[0] + hands[1].0[0] - 20.0).abs() < 1e-9);
+            assert!((hands[0].0[2] + hands[1].0[2] + 10.0).abs() < 1e-9);
+            let (dx, dz) = (hands[0].0[0] - 10.0, hands[0].0[2] + 5.0);
+            assert!((dx.hypot(dz) - 0.6).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn spellcasters_remember_an_unseen_player() {
+        use crate::mobs::world::{test_player, with_test_world};
+        let ran = with_test_world(&[], |w, types| {
+            let mut w = w.clone();
+            w.player = Some(test_player(Vec3::new(3.5, 64.0, 0.5)));
+            for name in [
+                "minecraft:evoker",
+                "minecraft:illusioner",
+                "minecraft:pillager",
+            ] {
+                let kind = Arc::new(types.types[name].clone());
+                let mut mob = Mob::new(1, kind, Vec3::new(0.5, 64.0, 0.5), 0.0);
+                let mut goals = std::mem::take(&mut mob.ai.targets);
+                let mut events = Vec::new();
+                let mut lr = horizon_core::random::LegacyRandom::new(0);
+                let mut cx = Cx {
+                    w: &w,
+                    lr: &mut lr,
+                    events: &mut events,
+                };
+                for _ in 0..100 {
+                    mob.ai.seen_cache.clear();
+                    goals.tick(&mut mob, &mut cx);
+                    if mob.ai.target.is_some() {
+                        break;
+                    }
+                }
+                assert_eq!(mob.ai.target, Some(Who::Player), "{name} acquired player");
+                let limit = if name == "minecraft:pillager" {
+                    30
+                } else {
+                    150
+                };
+                for _ in 0..limit {
+                    mob.ai.seen_cache = vec![(Who::Player, false)];
+                    goals.tick(&mut mob, &mut cx);
+                    assert_eq!(mob.ai.target, Some(Who::Player), "{name} lost player early");
+                }
+                mob.ai.seen_cache = vec![(Who::Player, false)];
+                goals.tick(&mut mob, &mut cx);
+                assert_eq!(mob.ai.target, None, "{name} should forget player");
+            }
+        });
+        // Without the vanilla data under .local/horizon-client the world
+        // cannot be built: the test has nothing to check.
+        let _ = ran;
+    }
+
     fn pillager() -> Mob {
         let mut kind = kind();
         let k = Arc::make_mut(&mut kind);
@@ -848,5 +1029,103 @@ mod tests {
                 .data()
                 .is_none_or(|d| d.charged.is_empty())
         );
+    }
+    /// `EvokerAttackSpellGoal.createSpellEntity` asks the block below for a
+    /// sturdy up face, not for a full cube. Soul sand is 14/16 high and still
+    /// supports a fang, which a full-collision test drops into the block.
+    #[test]
+    fn a_fang_stands_on_a_soul_sand_floor() {
+        let build = |world: &mut crate::world::World,
+                     registry: &horizon_world::registry::BlockRegistry| {
+            let stone = registry.default_state("minecraft:stone").unwrap();
+            let soul_sand = registry.default_state("minecraft:soul_sand").unwrap();
+            for cx in -1..1 {
+                for cz in -1..1 {
+                    world
+                        .chunks
+                        .insert((cx, cz), Arc::new(crate::chunk::Chunk::empty(cx, cz)));
+                }
+            }
+            for x in -4..4 {
+                for z in -4..4 {
+                    world.set(x, 63, z, stone).unwrap();
+                }
+            }
+            world.set(0, 64, 0, soul_sand).unwrap();
+        };
+        let ran = crate::mobs::world::with_built_test_world(&[], build, |w, _| {
+            // An evoker standing on the soul sand has its feet at 64.875, so
+            // the cast asks for a floor from 65 down: the soul sand at 64 is
+            // the first sturdy block and the fang sits at 65.
+            assert_eq!(fang_floor(w, 0.5, 0.5, 64.0, 65.875), Some(65.0));
+        });
+        let _ = ran;
+    }
+
+    /// `Vindicator.setCustomName` latches `isJohnny` the first time the name is
+    /// `Johnny`, and nothing clears it: the Johnny goal keeps attacking every
+    /// living entity after the mob is renamed, and `addAdditionalSaveData`
+    /// saves the flag (only when set) so a reload keeps it. Horizon read the live name each
+    /// tick and saved no flag, so a renamed vindicator stopped, and a reloaded
+    /// one that was named Johnny but is now Bob never started.
+    #[test]
+    fn a_vindicator_that_was_named_johnny_stays_johnny() {
+        use horizon_world::nbt::Tag;
+        let mut m = Mob::new(
+            1,
+            {
+                let mut kind = kind();
+                let k = Arc::make_mut(&mut kind);
+                k.id = "minecraft:vindicator".into();
+                k.species = Species::Vindicator;
+                kind
+            },
+            Vec3::new(0.5, 64.0, 0.5),
+            0.0,
+        );
+        assert_eq!(i8::from(m.extra.johnny), 0, "a vindicator with no name");
+        m.custom_name = Some("Bob".into());
+        vindicator_server_ai_step(&mut m);
+        assert_eq!(i8::from(m.extra.johnny), 0, "another name is no Johnny");
+        m.custom_name = Some("Johnny".into());
+        vindicator_server_ai_step(&mut m);
+        assert_eq!(i8::from(m.extra.johnny), 1, "the name sets the latch");
+        // Renamed, it stays Johnny: `setCustomName` only ever sets the flag.
+        m.custom_name = Some("Bob".into());
+        vindicator_server_ai_step(&mut m);
+        assert_eq!(
+            i8::from(m.extra.johnny),
+            1,
+            "a rename does not clear the latch"
+        );
+        // `Vindicator.addAdditionalSaveData` writes the flag, false or true.
+        let types = [("minecraft:vindicator".into(), m.kind.clone())].into();
+        let saved = crate::entity_nbt::mob_to_nbt(&m, [0; 4], None, None, |_| None);
+        assert_eq!(saved.get("Johnny"), Some(&Tag::Byte(1)));
+        let back = crate::entity_nbt::mob_from_nbt(&saved, &types, 2, None).unwrap();
+        assert_eq!(i8::from(back.extra.johnny), 1, "the reloaded flag");
+        // `readAdditionalSaveData`: `Johnny` absent is false, whatever the name
+        // in the compound is.
+        let mut silent = Tag::compound([
+            ("id", Tag::String("minecraft:vindicator".into())),
+            (
+                "Pos",
+                Tag::List(vec![
+                    Tag::Double(0.5_f64.to_bits()),
+                    Tag::Double(64.0_f64.to_bits()),
+                    Tag::Double(0.5_f64.to_bits()),
+                ]),
+            ),
+            ("CustomName", Tag::String("Johnny".into())),
+        ]);
+        let loaded = crate::entity_nbt::mob_from_nbt(&silent, &types, 3, None).unwrap();
+        assert_eq!(i8::from(loaded.extra.johnny), 0, "a save without the flag");
+        // `addAdditionalSaveData` writes nothing for a vindicator that is not
+        // Johnny, even over a compound that still carries `Johnny: 0b`.
+        if let Tag::Compound(c) = &mut silent {
+            c.insert("Johnny".into(), Tag::Byte(0));
+        }
+        let saved = crate::entity_nbt::mob_to_nbt(&loaded, [0; 4], Some(&silent), None, |_| None);
+        assert_eq!(saved.get("Johnny"), None);
     }
 }

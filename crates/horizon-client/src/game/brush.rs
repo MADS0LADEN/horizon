@@ -40,19 +40,49 @@ pub(super) type Brushing = HashMap<[i32; 3], BrushState>;
 impl Game<'_> {
     /// `BrushItem.onUseTick` for a brush used `ticks` ticks so far, the
     /// hand of `slot` acting.
-    pub(super) fn tick_brush(&mut self, slot: usize, ticks: u32) {
-        // No block under the crosshair: releaseUsingItem.
+    pub(super) fn tick_brush(
+        &mut self,
+        stack: &horizon_client::items::ItemStack,
+        slot: usize,
+        ticks: u32,
+    ) {
+        // No block under the crosshair: vanilla calls releaseUsingItem, which
+        // stops the use and causes the interaction vibration.
         let Some(hit) = self.pick() else {
-            self.using = None;
+            self.stop_using_item(stack);
             return;
         };
+        // `BrushItem.onUseTick` aims with `getHitResultOnViewVector` out to the
+        // block interaction range, for mobs too: a mob between the player and
+        // the block is nearer, so the hit is not a block and the use releases
+        // the same way. A guest acts on its client's targeted block, whose view
+        // we cannot trace here, so only the local aim runs the entity test.
+        if self.forced_hit.is_none()
+            && let Some((eye, _)) = self.aim()
+            && let Some((_, mob, _)) = self.mob_hit_within(self.block_reach)
+        {
+            let block = (
+                hit.point[0] - eye[0],
+                hit.point[1] - eye[1],
+                hit.point[2] - eye[2],
+            );
+            if mob <= (block.0 * block.0 + block.1 * block.1 + block.2 * block.2).sqrt() {
+                self.stop_using_item(stack);
+                return;
+            }
+        }
         let elapsed = ticks + 1;
         // The last tick before the backswing.
         if elapsed % 10 == 5 {
             self.brush_stroke(&hit, slot);
         }
-        // The use ends after 200 ticks; the held button starts it again.
-        self.using = (elapsed < USE_DURATION).then_some((slot, elapsed));
+        // The use ends after USE_DURATION; stopUsingItem causes the vibration
+        // (vanilla's tickUsingItem), the held button starts it again.
+        if elapsed < USE_DURATION {
+            self.using = Some((slot, elapsed));
+        } else {
+            self.stop_using_item(stack);
+        }
     }
 
     /// One stroke on the block aimed at: dust (this window only), the brush
@@ -71,7 +101,7 @@ impl Game<'_> {
         }
         let at = hit.pos.map(|v| f64::from(v) + 0.5);
         self.audio.play(sound, Some(at), 1.0, 1.0);
-        if brushable && self.brush_block(hit.pos, hit.face) {
+        if brushable && self.brush_block(hit.pos, hit.face, slot) {
             self.damage_held(1);
         }
     }
@@ -113,7 +143,7 @@ impl Game<'_> {
     }
 
     /// `BrushableBlockEntity.brush`: whether the block changed (the brush wears).
-    fn brush_block(&mut self, pos: [i32; 3], face: [i32; 3]) -> bool {
+    fn brush_block(&mut self, pos: [i32; 3], face: [i32; 3], slot: usize) -> bool {
         let time = self.world.game_time;
         let mut brush = self.brushing.remove(&pos).unwrap_or_default();
         brush.hit_face.get_or_insert(face);
@@ -141,7 +171,7 @@ impl Game<'_> {
         let before = completion_state(brush.count);
         brush.count += 1;
         if brush.count >= 10 {
-            self.brushing_completed(pos, brush.hit_face);
+            self.brushing_completed(pos, brush.hit_face, slot);
             return true;
         }
         self.schedule_brushable_tick(pos);
@@ -191,7 +221,7 @@ impl Game<'_> {
 
     /// `BrushableBlockEntity.brushingCompleted`: the item drops out of the
     /// brushed face and the block turns into its sand or gravel.
-    fn brushing_completed(&mut self, pos: [i32; 3], face: Option<[i32; 3]>) {
+    fn brushing_completed(&mut self, pos: [i32; 3], face: Option<[i32; 3]>, slot: usize) {
         let state = self.world.block(pos[0], pos[1], pos[2]);
         let turns_into = match &*self.res.facts().get(state).name {
             "minecraft:suspicious_sand" => "minecraft:sand",
@@ -212,7 +242,20 @@ impl Game<'_> {
                 f64::from(pos[1] + face[1]) + 0.625,
                 f64::from(pos[2] + face[2]) + 0.5,
             ];
-            self.spawn_item(item, at, [0.0; 3], 0);
+            let mut drops = vec![item];
+            let tool = self.stack_in(slot).cloned();
+            let origin = pos.map(|c| f64::from(c) + 0.5);
+            self.native_use_drops(
+                "",
+                origin,
+                Some((pos, state)),
+                None,
+                tool.as_ref(),
+                &mut drops,
+            );
+            for item in drops {
+                self.spawn_item(item, at, [0.0; 3], 0);
+            }
         }
         // Level event 3008 for every player, then the block change.
         self.level_event_at(3008, pos, state.0 as i32);

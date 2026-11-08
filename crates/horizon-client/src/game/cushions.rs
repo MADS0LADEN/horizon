@@ -6,12 +6,12 @@
 //! A cushion is a `BlockAttachedEntity`, not a block: it has no block state,
 //! only an entity whose `Pos` is the click point's height. Placement uses
 //! outline bounds, collision shapes and suffocation predicates.
-use super::{Game, Hit, InteractTarget};
+use super::{Game, Hit, InteractTarget, Keys, entity_culling::default_range, ray_box};
+use horizon_client::actions::Action;
 use horizon_client::entities::{Cushion, dye_index};
 use horizon_client::items::ItemStack;
 use horizon_client::mobs::anim::Poses;
 use horizon_core::geometry::{Aabb, Vec3};
-use winit::keyboard::KeyCode;
 
 /// `Direction.fromYRot(yaw).toYRot()`: the nearest 90 degree step.
 pub(crate) fn snap_yaw(yaw: f32) -> f32 {
@@ -149,7 +149,7 @@ impl Game<'_> {
         let reach: f64 = self.entity_reach;
         let mut best: Option<(usize, f64, [f64; 3])> = None;
         for (i, c) in self.cushions.iter().enumerate() {
-            let Some(d) = super::ray_box(eye, dir, reach, aabb(c.bounds())) else {
+            let Some(d) = ray_box(eye, dir, reach, aabb(c.bounds())) else {
                 continue;
             };
             if best.is_none_or(|b| d < b.1) {
@@ -278,6 +278,7 @@ impl Game<'_> {
             yaw: snap_yaw(self.yaw),
             color,
             check_interval: 0,
+            custom_name: None,
         });
         self.world
             .modified
@@ -323,7 +324,7 @@ impl Game<'_> {
             return false;
         }
         // isSecondaryUseActive.
-        if self.keys.contains(&KeyCode::ShiftLeft) {
+        if self.keys.held(Action::Sneak) {
             return false;
         }
         let id = self.cushions[i].id;
@@ -338,8 +339,16 @@ impl Game<'_> {
         }
         // `Entity.startRiding`: a passenger first gets off what it rides
         // (`stopRiding`), so a seated player moves to this cushion.
+        if !self.native_may_board(id) {
+            return true;
+        }
         self.stop_riding();
-        self.riding = Some(id);
+        // startRiding stops when stopRiding left the passenger seated (a mod
+        // canceled the dismount).
+        if self.riding.is_some() {
+            return true;
+        }
+        self.start_riding(id);
         let p = self.cushions[i].position;
         self.audio.play(
             "minecraft:entity.cushion.sit",
@@ -359,8 +368,10 @@ impl Game<'_> {
         if !self.before_block(d) || self.mob_hit().is_some_and(|m| m.1 < d) {
             return false;
         }
-        // `skipAttackInteraction` when `mayInteract` is false.
+        // `Cushion.hurtServer` refuses a player who may not build, so
+        // skipAttackInteraction is false and Player.attack goes on to onAttack.
         if !self.may_build() {
+            self.attack_ticks = 0;
             return true;
         }
         self.break_cushion(i, true);
@@ -374,8 +385,10 @@ impl Game<'_> {
         let p = c.position;
         self.world.modified.insert((c.pos[0] >> 4, c.pos[2] >> 4));
         if self.riding == Some(c.id) {
-            self.riding = None;
+            self.dismount_removed_vehicle(p.y);
         }
+        // BlockAttachedEntity.kill, before dropItem.
+        self.entity_killed_event([p.x, p.y, p.z], by_player);
         self.audio.play(
             "minecraft:entity.cushion.break",
             Some([p.x, p.y, p.z]),
@@ -386,13 +399,20 @@ impl Game<'_> {
         if !self.ui.rules.bool("entity_drops") || (by_player && self.creative) {
             return;
         }
-        let stack = ItemStack {
-            item: std::sync::Arc::from(c.item()),
-            count: 1,
-            damage: 0,
-            extra: None,
-        };
+        let stack = c.item_stack_with_data();
         self.spawn_item(stack, [p.x, p.y, p.z], [0.0; 3], 10);
+    }
+
+    /// `Entity.kill` of a cushion (`/kill`): gone with no drop, its rider let go.
+    pub(super) fn kill_cushion(&mut self, id: u32) {
+        let Some(i) = self.cushions.iter().position(|c| c.id == id) else {
+            return;
+        };
+        let c = self.cushions.remove(i);
+        self.world.modified.insert((c.pos[0] >> 4, c.pos[2] >> 4));
+        if self.riding == Some(c.id) {
+            self.dismount_removed_vehicle(c.position.y);
+        }
     }
 
     /// `Cushion.showBreakingParticles`: ten of the matching wool block.
@@ -452,6 +472,9 @@ impl Game<'_> {
     /// and `Cushion.removePassenger`'s get-up sound for a rider that left
     /// rather than one whose cushion was killed.
     pub(super) fn get_up_from_cushion(&mut self, c: &Cushion) {
+        if self.riding == Some(c.id) && !self.native_may_leave(c.id) {
+            return;
+        }
         let at = c.dismount();
         self.riding = None;
         if let Some(p) = self.player.as_mut() {
@@ -468,8 +491,93 @@ impl Game<'_> {
         );
     }
 
+    /// `LivingEntity.dismountVehicle` from a removed vehicle (a broken
+    /// cushion) whose position was at `vehicle_y`: up to the higher of the
+    /// rider's and the vehicle's heights, then the free spot nearest there
+    /// (`findFreePosition` within the rider's own box). No get-up sound:
+    /// `Cushion.removePassenger` plays none once the cushion is removed.
+    pub(super) fn dismount_removed_vehicle(&mut self, vehicle_y: f64) {
+        self.riding = None;
+        let border = self.border_bounds();
+        let b = self.res.behaviours();
+        let Some(p) = self.player.as_ref() else {
+            return;
+        };
+        let (w, h) = (
+            f64::from(p.dimensions.width),
+            f64::from(p.dimensions.height),
+        );
+        let mut at = Vec3::new(p.position.x, p.position.y.max(vehicle_y), p.position.z);
+        // `getBbWidth() <= 4 && getBbHeight() <= 4`.
+        if w <= 4.0 && h <= 4.0 {
+            let center = at.add_vector(Vec3::new(0.0, h / 2.0, 0.0));
+            let size = Vec3::new(w, h, w);
+            let free = horizon_world::level::portal_travel::find_free_position(
+                Aabb::of_size(center, size),
+                center,
+                size,
+                &border,
+                |q| {
+                    b.collision_shape(self.world.block(q.x, q.y, q.z))
+                        .map(|s| s.moved(Vec3::new(f64::from(q.x), f64::from(q.y), f64::from(q.z))))
+                },
+            );
+            if let Some(free) = free {
+                at = free.add_vector(Vec3::new(0.0, -h / 2.0, 0.0));
+            }
+        }
+        if let Some(p) = self.player.as_mut() {
+            self.previous_position = p.position;
+            p.position = at;
+            p.velocity = Vec3::ZERO;
+            p.fall_distance = 0.0;
+        }
+    }
+
+    /// `LivingEntity.dismountVehicle` from a live vehicle at `vehicle` whose
+    /// block (`blockPosition`) is in `#minecraft:portals`: the rider leaves by
+    /// the same free-position branch as from a removed vehicle, not beside it.
+    /// True when it did.
+    pub(super) fn dismount_in_portal(&mut self, vehicle: Vec3) -> bool {
+        let pos = [
+            vehicle.x.floor() as i32,
+            vehicle.y.floor() as i32,
+            vehicle.z.floor() as i32,
+        ];
+        if !self.block_in_tag("minecraft:portals", &self.block_name(pos)) {
+            return false;
+        }
+        self.dismount_removed_vehicle(vehicle.y);
+        true
+    }
+
+    /// `Entity.positionRider` for the mobs (and other players) sitting on a
+    /// cushion: its passenger attachment `(0, 0.25, 0)`, less the rider's own
+    /// vehicle attachment. A server sends no position for a passenger, so
+    /// every client seats it here.
+    pub(super) fn seat_cushion_mobs(&mut self, riding: &super::passengers::Riders) {
+        for c in &self.cushions {
+            let Some(js) = riding.get(&c.id) else {
+                continue;
+            };
+            for &j in js {
+                let m = &mut self.mobs[j];
+                // Cushion's box is 1 wide.
+                let offset = horizon_client::mobs::riders::vehicle_attachment(m, 1.0);
+                let at = Vec3::new(c.position.x, c.position.y + 0.25 - offset, c.position.z);
+                m.position = at;
+                m.previous = at;
+                m.velocity = Vec3::ZERO;
+                m.fall_distance = 0.0;
+                m.on_ground = false;
+                m.extra.passenger = true;
+                m.ai.nav.stop();
+            }
+        }
+    }
+
     /// `Player.rideTick` on a cushion: hold the seat, and get up on sneak.
-    pub(super) fn tick_cushion_riding(&mut self, keys: super::Keys) -> bool {
+    pub(super) fn tick_cushion_riding(&mut self, keys: Keys) -> bool {
         let Some(c) = self
             .cushions
             .iter()
@@ -504,14 +612,13 @@ impl Game<'_> {
         };
         let sprites = &self.gui.atlas.sprites;
         for c in &self.cushions {
-            let entity_start = out.len();
             let a = aabb(c.bounds());
             let (lo, hi) = (a.min_position(), a.max_position());
             let (lo, hi) = (
                 glam::DVec3::new(lo.x, lo.y, lo.z),
                 glam::DVec3::new(hi.x, hi.y, hi.z),
             );
-            let range = super::entity_culling::default_range(hi - lo, self.view_scale());
+            let range = default_range(hi - lo, self.view_scale());
             if !self.entity_in_view(camera, (lo + hi) / 2.0, range, lo, hi) {
                 continue;
             }
@@ -521,6 +628,11 @@ impl Game<'_> {
             else {
                 continue;
             };
+            let culling = self.entity_cull_decision(c, 1.0);
+            if culling.hides_entity() {
+                continue;
+            }
+            let entity_start = out.len();
             let p = glam::DVec3::new(c.position.x, c.position.y, c.position.z) - camera;
             let base = glam::Mat4::from_translation(p.as_vec3())
                 * glam::Mat4::from_rotation_y((180.0 - snap_yaw(c.yaw)).to_radians())
@@ -543,7 +655,36 @@ impl Game<'_> {
                 0,
                 out,
             );
-            self.cull_entity_vertices(out, entity_start);
+            self.finish_entity_occlusion(culling, c, out, entity_start);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use horizon_world::nbt::Tag;
+
+    /// `Cushion.getCushionItemStackWithData`: a named cushion drops named.
+    #[test]
+    fn a_named_cushion_drops_with_its_name() {
+        let c = Cushion {
+            id: 1,
+            position: Vec3::ZERO,
+            pos: [0, 64, 0],
+            yaw: 0.0,
+            color: 1,
+            check_interval: 0,
+            custom_name: Some(Tag::String("Seat".into())),
+        };
+        let stack = c.item_stack_with_data();
+        assert_eq!(&*stack.item, "minecraft:orange_cushion");
+        assert!(stack.data().is_some_and(|d| d.custom_name.is_some()));
+        // An unnamed one gains no component.
+        let c = Cushion {
+            custom_name: None,
+            ..c
+        };
+        assert!(c.item_stack_with_data().data().is_none());
     }
 }

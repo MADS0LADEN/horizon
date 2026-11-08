@@ -8,8 +8,105 @@
 use super::{Game, commands::Target};
 use horizon_core::geometry::Vec3;
 
+/// The `EquipmentSlot` names of `Mob::equipment_stacks`, in its order.
+const MOB_SLOTS: [&str; 8] = [
+    "mainhand", "offhand", "feet", "legs", "chest", "head", "body", "saddle",
+];
+
+impl Game<'_> {
+    /// `LivingEntity.collectEquipmentChanges` for the mobs that tick: each
+    /// slot that holds another stack than the mods last heard is told
+    /// (`native_living_equipment_change`). A mob new to the level counts from
+    /// empty, as vanilla's `lastEquipmentItems` does. Only while a mod
+    /// listens (`native_living_equipment_listened`): a mob's first tick after
+    /// that counts from empty too.
+    pub(super) fn native_mobs_equipment(&mut self) {
+        if self.remote.is_some() || self.options.execution_role.is_client() {
+            return;
+        }
+        // Reading every mob's equipment each tick costs: only when a mod listens.
+        let mut listened = false;
+        self.native_living_equipment_listened(&mut listened);
+        if !listened {
+            return;
+        }
+        let ticking = self.entity_ticking_area();
+        let mut changes = Vec::new();
+        for m in self.mobs.iter_mut().filter(|m| !m.removed) {
+            if !ticking(m.position.x.floor() as i32, m.position.z.floor() as i32) {
+                continue;
+            }
+            let now = m.equipment_stacks();
+            let heard = m.extra.equipment_heard.get_or_insert_with(Default::default);
+            if **heard == now {
+                continue;
+            }
+            for (slot, name) in MOB_SLOTS.into_iter().enumerate() {
+                if now[slot] != heard[slot] {
+                    let from = heard[slot].take();
+                    changes.push((m.id, m.kind.id.clone(), name, from, now[slot].clone()));
+                }
+            }
+            **heard = now;
+        }
+        for (id, kind, slot, from, to) in changes {
+            self.native_living_equipment_change(id, &kind, slot, from.as_ref(), to.as_ref());
+        }
+    }
+}
+
+impl Game<'_> {
+    /// `LivingEntity.collectEquipmentChanges` for the server's players (they are living entities
+    /// too): each slot whose stack differs from what the mods last heard is told, the previous
+    /// stack with it, so a hotbar selection that moves the main hand counts. A player new to the
+    /// level counts from empty, as for mobs, and only while a mod listens.
+    pub(super) fn native_players_equipment(&mut self, host: &mut super::lan::LanHost) {
+        let mut listened = false;
+        self.native_living_equipment_listened(&mut listened);
+        if !listened {
+            return;
+        }
+        let mut changes = Vec::new();
+        for g in host.hub.guests.iter().filter(|g| host.hub.here(g)) {
+            let now: [Option<crate::items::ItemStack>; 6] = [
+                g.inventory.get(g.selected).cloned().flatten(),
+                g.offhand.clone(),
+                g.armor[3].clone(),
+                g.armor[2].clone(),
+                g.armor[1].clone(),
+                g.armor[0].clone(),
+            ];
+            let Some(play) = host.play.get_mut(&g.conn) else {
+                continue;
+            };
+            let heard = play.equipment_heard.get_or_insert_with(Default::default);
+            if **heard == now {
+                continue;
+            }
+            for (slot, name) in PLAYER_SLOTS.into_iter().enumerate() {
+                if now[slot] != heard[slot] {
+                    let from = heard[slot].take();
+                    changes.push((g.entity_id as u32, name, from, now[slot].clone()));
+                }
+            }
+            **heard = now;
+        }
+        for (id, slot, from, to) in changes {
+            self.native_living_equipment_change(
+                id,
+                "minecraft:player",
+                slot,
+                from.as_ref(),
+                to.as_ref(),
+            );
+        }
+    }
+}
+
+/// The `EquipmentSlot` names of a player's equipment, in the order of `native_players_equipment`.
+const PLAYER_SLOTS: [&str; 6] = ["mainhand", "offhand", "feet", "legs", "chest", "head"];
+
 /// A mob as a native mod reads it.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct NativeMob {
     pub(crate) id: u32,
@@ -25,7 +122,6 @@ pub(crate) struct NativeMob {
 }
 
 /// What a mob starts with (`native_spawn_mob`); the default is a plain mob.
-#[allow(dead_code)]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct NativeSpawn {
     /// A name over it, shown to everyone.
@@ -44,7 +140,7 @@ fn finite(v: [f64; 3]) -> bool {
 }
 
 /// `/summon`'s world bounds (`Level.isInSpawnableBounds`).
-fn spawnable(pos: [f64; 3]) -> bool {
+pub(super) fn spawnable(pos: [f64; 3]) -> bool {
     finite(pos)
         && (-30_000_000.0..30_000_000.0).contains(&pos[0])
         && (-30_000_000.0..30_000_000.0).contains(&pos[2])
@@ -52,7 +148,7 @@ fn spawnable(pos: [f64; 3]) -> bool {
 }
 
 // Native mods use these; nothing in Horizon does.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "native mod API (docs/native-mods.md)")]
 impl Game<'_> {
     /// Whether this is a level that simulates (not a client's copy) and the one
     /// in place is `dimension`.
@@ -61,10 +157,13 @@ impl Game<'_> {
     }
     /// Spawns a mob of `kind` (`minecraft:zombie`) at `pos` in the level in
     /// place, `dimension`, finalized as a natural spawn is, and kept when the
-    /// chunk unloads: its id. None for a kind the game doesn't know, another
-    /// dimension, a position outside `/summon`'s bounds or in a chunk that isn't
+    /// chunk unloads: its id. None for a kind the game doesn't know, a
+    /// position outside `/summon`'s bounds or in a chunk that isn't
     /// loaded (it would never tick or be saved), or a monster on peaceful (it
-    /// would despawn at once). API 37.
+    /// would despawn at once). API 37. Since API @API:npc_any_level@,
+    /// `dimension` may be any level the server has loaded, which is put in
+    /// place for the spawn (`execute in <dimension> run summon`), so a
+    /// `native_server_tick` hook spawns too; a level not loaded is refused.
     pub(super) fn native_spawn_mob(
         &mut self,
         dimension: &str,
@@ -72,6 +171,13 @@ impl Game<'_> {
         pos: [f64; 3],
         options: &NativeSpawn,
     ) -> Option<u32> {
+        if self.remote.is_none() && dimension != self.dim.id() {
+            return self
+                .npc_in_level(dimension, |g| {
+                    g.native_spawn_mob(dimension, kind, pos, options)
+                })
+                .flatten();
+        }
         if !self.native_mob_level(dimension) || !spawnable(pos) || !self.native_chunk_loaded(pos) {
             return None;
         }

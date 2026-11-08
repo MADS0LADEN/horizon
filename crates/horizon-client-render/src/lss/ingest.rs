@@ -157,7 +157,9 @@ fn decode_column(
         columns.as_ref(),
         coarse.clone(),
     );
-    Ok((ReducedColumns::new(columns), coarse))
+    // Every width `Lod::apply_columns` reads, built here on the decode thread
+    // rather than on the frame that applies them.
+    Ok((ReducedColumns::new(columns).warm(0b1111), coarse))
 }
 
 #[cfg(test)]

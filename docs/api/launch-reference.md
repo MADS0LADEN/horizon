@@ -1,4 +1,4 @@
-<!-- Generated from crates/horizon-client/src/game/launch_api.rs; a test fails when this file is out of date. Update it with: HORIZON_WRITE_DOCS=1 cargo test -p horizon-client --bin horizon-client launch_api -->
+<!-- Generated from crates/horizon-client/src/game/launch_api.rs; a test fails when this file is out of date. Update it with: HORIZON_WRITE_DOCS=1 cargo test -p horizon-client --lib launch_api -->
 # Launch API reference
 
 What `horizon-client` promises a launcher that starts it, Launch API 0.1.0. The guide: [launch.md](launch.md); stability and versions: [stability.md](stability.md).
@@ -12,6 +12,7 @@ Any other option is refused with exit code 2, so ask `--launch-api` before passi
 | `--resources DIR` | The prepared resources (horizon-prepare's output). Default: `resources` beside the executable, else `.local/horizon-client/26.3`. |
 | `--game-dir DIR` | The game folder: `saves/`, `options.txt`, `resourcepacks/`, `horizon-mods/`, `screenshots/`. Created when missing. Default: the working directory. `--gameDir` is the same. |
 | `--home DIR` | Logs (`logs/latest.log`) and crash reports (`crash-reports/`). Default: `HORIZON_HOME`, else `horizon` in the platform data folder. |
+| `--player-dir DIR` | One player's own files, for several games playing in one game folder at the same time: `options.txt` and the settings beside it, `logs/`, `crash-reports/`, `horizon-player.txt`, `servers.dat`, `hotbar.nbt`, `screenshots/`. Saves, packs, mods and their config, the chat's command history and Play with Friends' relay settings stay in the game folder. A relative path is taken from the folder the game starts in. Created when missing. Default: the game folder, and `--home` for logs. Crash telemetry still follows `--home`'s consent, and `horizon-ctl logs` and the launcher read `--home`'s logs. |
 | `--width N` | The window's starting width (default 1280). |
 | `--height N` | The window's starting height (default 720). |
 | `--fullscreen` | Opens the window fullscreen, whatever `options.txt` says; `options.txt` is not changed. |
@@ -27,6 +28,42 @@ Prints one JSON object on stdout and exits 0. `horizon` is the build's version; 
 
 ```json
 {
+  "content": {
+    "datapack": {
+      "format": [
+        121,
+        0
+      ]
+    },
+    "index": {
+      "schema": 1
+    },
+    "mod": {
+      "api": [
+        "0.2",
+        "0.3"
+      ]
+    },
+    "modpack": {
+      "format": 1
+    },
+    "native_mod": {
+      "hooks": "<hooks level>",
+      "rebuild": true
+    },
+    "resourcepack": {
+      "format": [
+        97,
+        1
+      ]
+    },
+    "shader": {
+      "api": [
+        "0.1"
+      ],
+      "schema": 1
+    }
+  },
   "crash_report_line": "Horizon: crash report saved to ",
   "exit_codes": [
     0,
@@ -48,6 +85,10 @@ Prints one JSON object on stdout and exits 0. `horizon` is the build's version; 
     },
     {
       "name": "--home",
+      "value": "DIR"
+    },
+    {
+      "name": "--player-dir",
       "value": "DIR"
     },
     {
@@ -85,6 +126,8 @@ Prints one JSON object on stdout and exits 0. `horizon` is the build's version; 
   ]
 }
 ```
+
+`content` is what this build loads ([content.md](content.md)), so a launcher offers only what works on it: content mods of the manifest `api` lines in `mod.api`; native mods built for hooks up to `native_mod.hooks`, which need the game rebuilt (`rebuild`); shader packs of `shader.schema` and the lines in `shader.api` (a newer line is read, not drawn); resource and data packs of `format` (`[major, minor]`; others still load, marked too old or too new as vanilla marks them); modpacks of `modpack.format`; the mod index of `index.schema`.
 
 ## Exit codes
 

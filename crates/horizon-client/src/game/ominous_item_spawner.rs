@@ -21,8 +21,10 @@ const TICKS_SCALING: f32 = 50.0;
 const ROTATION_SPEED: f32 = 40.0;
 
 pub(super) struct OminousItemSpawner {
-    /// The entity id a server tracks it by (0 until it is tracked).
+    /// Its entity id: from the entity counter on the server, the server's on
+    /// a client.
     pub(super) id: u32,
+    /// `DATA_ITEM`; `minecraft:air` stands for `ItemStack.EMPTY`.
     pub(super) item: ItemStack,
     pub(super) position: [f64; 3],
     pub(super) spawn_item_after: i64,
@@ -66,8 +68,9 @@ impl Game<'_> {
         position: [f64; 3],
         delay: i32,
     ) {
+        self.next_entity += 1;
         self.ominous_spawners.push(OminousItemSpawner {
-            id: 0,
+            id: self.next_entity,
             item,
             position,
             spawn_item_after: i64::from(delay),
@@ -84,14 +87,19 @@ impl Game<'_> {
         else {
             return;
         };
+        self.next_entity += 1;
+        let id = self.next_entity;
+        let saved = horizon_client::entity_nbt::uuid(&tag);
+        // Its saved UUID and the attachments saved under it (#7398).
+        self.remember_uuid(id, saved, &tag);
+        let uuid = self.uuid_for(id);
         self.ominous_spawners.push(OminousItemSpawner {
-            id: 0,
+            id,
             item,
             position: [at.x, at.y, at.z],
             spawn_item_after,
             tick_count: 0,
-            uuid: horizon_client::entity_nbt::uuid(&tag)
-                .unwrap_or_else(horizon_client::save::random_uuid),
+            uuid,
             raw: Some(Box::new(tag)),
         });
     }
@@ -106,7 +114,8 @@ impl Game<'_> {
             let at = block(s.position);
             let center = at.map(|v| f64::from(v) + 0.5);
             if s.tick_count == s.spawn_item_after - ABOUT_TO_SPAWN {
-                self.audio.play(
+                self.audio.play_on(
+                    6, // SoundSource.NEUTRAL, as OminousItemSpawner.tickServer selects.
                     "minecraft:block.trial_spawner.about_to_spawn_item",
                     Some(center),
                     1.0,
@@ -154,6 +163,10 @@ impl Game<'_> {
     /// `spawnItem`: a projectile shot down, or an item entity; level event
     /// 3021 and the entity_place game event.
     fn spawn_ominous_item(&mut self, s: &OminousItemSpawner) {
+        // An empty item spawns nothing, and no event marks it.
+        if &*s.item.item == "minecraft:air" {
+            return;
+        }
         let at = block(s.position);
         let p = s.position;
         match projectile(&s.item.item) {
@@ -164,7 +177,9 @@ impl Game<'_> {
                 let from = Vec3::new(p[0], p[1], p[2]);
                 self.shoot_projectile_item(from, [0.0, -1.0, 0.0], &s.item, power, uncertainty);
             }
-            None => self.spawn_item(s.item.clone(), p, super::dispenser::new_item_motion(), 0),
+            None => {
+                self.spawn_item_own(s.item.clone(), p, 0);
+            }
         }
         self.level_event_at(3021, at, 1);
         self.post_block_game_event("minecraft:entity_place", at, None, None);
@@ -225,3 +240,6 @@ impl Game<'_> {
         }
     }
 }
+
+#[cfg(test)]
+mod warning_tests;
